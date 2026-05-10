@@ -1,0 +1,177 @@
+// ignore: unused_import
+import 'package:intl/intl.dart' as intl;
+import 'app_localizations.dart';
+
+// ignore_for_file: type=lint
+
+/// The translations for Korean (`ko`).
+class AppLocalizationsKo extends AppLocalizations {
+  AppLocalizationsKo([String locale = 'ko']) : super(locale);
+
+  @override
+  String get appTitle => 'Hana';
+
+  @override
+  String get loginTitle => '???';
+
+  @override
+  String get loginWithPhone => '????? ???';
+
+  @override
+  String get loginWithGoogle => 'Google? ???';
+
+  @override
+  String get onboardingTitle => '??? ??';
+
+  @override
+  String get next => '??';
+
+  @override
+  String get back => '??';
+
+  @override
+  String get submit => '??';
+
+  @override
+  String get profileDisplayName => '??';
+
+  @override
+  String get profileBio => '????';
+
+  @override
+  String get profileGender => '??';
+
+  @override
+  String get profileNationality => '??';
+
+  @override
+  String get profileBirthYear => '????';
+
+  @override
+  String get genderMale => '??';
+
+  @override
+  String get genderFemale => '??';
+
+  @override
+  String get nationalityKR => '????';
+
+  @override
+  String get nationalityJP => '??';
+
+  @override
+  String get discoveryNoMoreCandidates => '? ?? ??? ???? ????.';
+
+  @override
+  String get discoveryQuotaExhausted =>
+      '?? ?? ??? ?? ??????. ?? ???? ????? ?? ??????.';
+
+  @override
+  String get like => '???';
+
+  @override
+  String get pass => '????';
+
+  @override
+  String get match => '???????';
+
+  @override
+  String get chat => '??';
+
+  @override
+  String get matchesTitle => '?? ??';
+
+  @override
+  String get noMatches => '?? ??? ????.';
+
+  @override
+  String get sendMessage => '??';
+
+  @override
+  String get messageInputHint => '???? ?????';
+
+  @override
+  String get reportTitle => '??';
+
+  @override
+  String get blockUser => '??';
+
+  @override
+  String get reportUser => '????';
+
+  @override
+  String get settingsTitle => '??';
+
+  @override
+  String get logout => '????';
+
+  @override
+  String get errorGeneric => '??? ??????. ?? ??????.';
+
+  @override
+  String get loading => '?? ?...';
+
+  @override
+  String get skip => '????';
+
+  @override
+  String get profilePhotoHint => '?? ?? (1~6?)';
+
+  @override
+  String get preferredGender => '???? ??';
+
+  @override
+  String get preferredNationality => '???? ??';
+
+  @override
+  String get preferredAgeRange => '???? ???';
+
+  @override
+  String get nativeLanguage => '???';
+
+  @override
+  String get learningLanguage => '??? ?? ??';
+
+  @override
+  String get residingCountry => '?? ??';
+
+  @override
+  String get languageKorean => '???';
+
+  @override
+  String get languageJapanese => '???';
+
+  @override
+  String quotaRemaining(int remaining) {
+    return '?? ??: $remaining?';
+  }
+
+  @override
+  String get purchaseMore => '?? ??';
+
+  @override
+  String resetAt(String time) {
+    return '?? ??: $time';
+  }
+
+  @override
+  String get noMessages => '?? ???? ????.';
+
+  @override
+  String get typeMessage => '???? ?????';
+
+  @override
+  String get discovery => '??';
+
+  @override
+  String get translating => '?? ?...';
+
+  @override
+  String get retry => '?? ??';
+
+  @override
+  String get noCandidatesAvailable => '??? ??? ??? ????.';
+
+  @override
+  String get matches => '??';
+}

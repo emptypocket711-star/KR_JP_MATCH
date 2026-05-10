@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "701242900024",
+    "project_id": "hana-e2ee6",
+    "storage_bucket": "hana-e2ee6.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:701242900024:android:64219146df3291b21e30cd",
+        "android_client_info": {
+          "package_name": "com.hana.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "701242900024-ofi1jb25ula1ampo4pm86v8j1r3v8rbo.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.hana.app",
+            "certificate_hash": "88a20947b933745a2348eed811266ec9989c03ec"
+          }
+        },
+        {
+          "client_id": "701242900024-c2a9vjjhuo2t0i0q1fppn5sn2mhki4ct.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBSjT_60NLy-pOxeKK1Qu75kEbojhwdyFk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "701242900024-c2a9vjjhuo2t0i0q1fppn5sn2mhki4ct.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

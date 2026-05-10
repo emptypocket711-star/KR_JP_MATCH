@@ -1,0 +1,27 @@
+{
+  "firestore": {
+    "rules": "firebase/firestore.rules",
+    "indexes": "firebase/firestore.indexes.json"
+  },
+  "functions": {
+    "source": "firebase/functions",
+    "predeploy": [
+      "npm --prefix \"$RESOURCE_DIR\" run build"
+    ]
+  },
+  "storage": {
+    "rules": "firebase/storage.rules"
+  },
+  "flutter": {
+    "platforms": {
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "hana-e2ee6",
+          "configurations": {
+            "android": "1:701242900024:android:64219146df3291b21e30cd"
+          }
+        }
+      }
+    }
+  }
+}

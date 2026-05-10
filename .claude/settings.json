@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./android/key.properties)",
+      "Read(./ios/**/GoogleService-Info.plist)",
+      "Read(./android/app/google-services.json)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'if command -v dart >/dev/null 2>&1; then dart format .; fi; if command -v flutter >/dev/null 2>&1; then flutter analyze; fi'"
+          }
+        ]
+      }
+    ]
+  }
+}
