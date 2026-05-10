@@ -1,19 +1,26 @@
-# KRJP Match App Scaffold
+# KR/JP Match App
 
-Flutter/Firebase scaffold for a Korea-Japan matchmaking app with Claude Code agent structure.
+Flutter/Firebase app for a Korea-Japan social matching and language-exchange
+product.
 
-## Core product flow
+## Current Product Flow
+
 - onboarding
 - profile setup
-- discovery (1 at a time)
-- like / pass
-- mutual match
+- discovery feed
+- profile detail
+- direct chat room creation from the chat CTA
 - translated chat
+- lounge community feed
 - trust & safety
 - monetization
 
+Chat is not gated by mutual matching. Swipe-based discovery and mutual-like chat
+unlock are not part of the current product direction.
+
 ## Notes
+
 - Android-first
 - Flutter + Firebase
 - Korean / Japanese first
-- Uses Claude Code project-level agents under `.claude/agents/`
+- Agent/project guidance lives in `AGENTS.md`
