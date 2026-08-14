@@ -113,11 +113,18 @@ ERROR
   PROJECT_NUMBER="$(gcloud projects describe "$EXPECTED_PROJECT" \
     --format='value(projectNumber)')"
   STORAGE_SERVICE_AGENT="service-${PROJECT_NUMBER}@gcp-sa-firebasestorage.iam.gserviceaccount.com"
-  if ! gcloud projects get-iam-policy "$EXPECTED_PROJECT" \
+  STORAGE_RULES_ROLE_OUTPUT="$(gcloud projects get-iam-policy "$EXPECTED_PROJECT" \
     --flatten='bindings[].members' \
     --filter="bindings.role=roles/firebaserules.firestoreServiceAgent AND bindings.members=serviceAccount:${STORAGE_SERVICE_AGENT}" \
-    --format='value(bindings.role)' | rg -Fxq 'roles/firebaserules.firestoreServiceAgent'
-  then
+    --format='value(bindings.role)')"
+  STORAGE_RULES_ROLE_FOUND=false
+  while IFS= read -r storage_rules_role; do
+    if [[ "$storage_rules_role" == 'roles/firebaserules.firestoreServiceAgent' ]]; then
+      STORAGE_RULES_ROLE_FOUND=true
+      break
+    fi
+  done <<< "$STORAGE_RULES_ROLE_OUTPUT"
+  if [[ "$STORAGE_RULES_ROLE_FOUND" != true ]]; then
     echo "Storage Rules cross-service Firestore IAM binding is missing." >&2
     exit 64
   fi
