@@ -2,8 +2,8 @@ import * as admin from 'firebase-admin';
 import { createHash, randomUUID } from 'crypto';
 import * as functions from 'firebase-functions/v1';
 import { Translate } from '@google-cloud/translate/build/src/v2';
-import { RtcRole, RtcTokenBuilder } from 'agora-token';
 import { createAccountDeletionProcessor } from './accountDeletionWorker';
+import { buildScopedAgoraRtcToken } from './agoraRtcToken';
 import {
   decideCloseActiveChatPolicy,
   decideStartChatPolicy,
@@ -76,9 +76,15 @@ import {
 } from './callablePolicy';
 import {
   callEntitlementIssue,
+  callExtensionOperationId,
+  callRingingTtlSeconds,
   callTokenLifetimeSeconds,
+  decideActiveCallReplacement,
   decideCallExtension,
+  decideCallExtensionReplay,
+  incomingCallNotificationTtlMillis,
   JoinableCallStatus,
+  normalizeCallExtensionRequestId,
   videoSegmentPoints as VIDEO_SEGMENT_POINTS,
   videoSegmentSeconds as VIDEO_SEGMENT_SECONDS,
   voiceExtensionPoints as VOICE_EXTENSION_POINTS,
@@ -266,6 +272,8 @@ interface PublicProfile {
 
 interface QuotaEventData {
   uid: string;
+  callId?: string;
+  clientRequestId?: string;
   eventType: 'grant' | 'consume';
   amount: number;
   reason: string;
@@ -1336,6 +1344,7 @@ function buildAgoraRtcToken(params: {
   appCertificate: string;
   channelName: string;
   uid: string;
+  callType: 'voice' | 'video';
   paidUntilAtMillis: number;
 }): { rtcUid: number; token: string; expiresAt: number } {
   const nowMillis = Date.now();
@@ -1351,15 +1360,14 @@ function buildAgoraRtcToken(params: {
   return {
     rtcUid,
     expiresAt,
-    token: RtcTokenBuilder.buildTokenWithUid(
-      params.appId,
-      params.appCertificate,
-      params.channelName,
-      rtcUid,
-      RtcRole.PUBLISHER,
+    token: buildScopedAgoraRtcToken({
+      appId: params.appId,
+      appCertificate: params.appCertificate,
+      channelName: params.channelName,
+      uid: rtcUid,
+      callType: params.callType,
       lifetimeSeconds,
-      lifetimeSeconds
-    ),
+    }),
   };
 }
 
@@ -1370,6 +1378,7 @@ interface ValidatedCallEntitlement {
   matchId: string;
   callType: 'voice' | 'video';
   roomName: string;
+  ringingExpiresAtMillis: number | null;
   paidUntilAtMillis: number | null;
   callerRef: FirebaseFirestore.DocumentReference;
   calleeRef: FirebaseFirestore.DocumentReference;
@@ -1442,6 +1451,8 @@ async function requireCallEntitlement(
   const matchData = matchSnap.data() ?? {};
   const pairData = pairSnap.data() ?? {};
   const activeCallData = activeCallSnap.data() ?? {};
+  const ringingExpiresAtMillis =
+    callData.ringingExpiresAt?.toMillis?.() ?? null;
   const paidUntilAtMillis = callData.paidUntilAt?.toMillis?.() ?? null;
   const now = admin.firestore.Timestamp.now();
   const issue = callEntitlementIssue({
@@ -1455,6 +1466,7 @@ async function requireCallEntitlement(
     callType: callData.type,
     roomName: callData.roomName,
     callStatus: callData.status,
+    ringingExpiresAtMillis,
     paidUntilAtMillis,
     callerActive: activeAccountIssue({
       exists: callerAccountSnap.exists,
@@ -1494,6 +1506,7 @@ async function requireCallEntitlement(
     matchId,
     callType: callData.type as 'voice' | 'video',
     roomName: callData.roomName as string,
+    ringingExpiresAtMillis,
     paidUntilAtMillis,
     callerRef,
     calleeRef,
@@ -1535,6 +1548,14 @@ async function notifyIncomingCall(params: {
     entitlement.callData.type !== params.type
   ) return;
 
+  const ringingExpiresAtMillis = entitlement.ringingExpiresAtMillis;
+  if (ringingExpiresAtMillis == null) return;
+  const notificationTtlMillis = incomingCallNotificationTtlMillis({
+    ringingExpiresAtMillis,
+    nowMillis: Date.now(),
+  });
+  if (notificationTtlMillis == null) return;
+
   const recipientData = entitlement.calleeAccountSnap.data();
   const fcmToken: string | null = recipientData?.fcmToken ?? null;
   const notificationsEnabled: boolean =
@@ -1555,11 +1576,18 @@ async function notifyIncomingCall(params: {
         callId: params.callId,
         matchId: params.matchId,
         callType: params.type,
+        ringingExpiresAt: ringingExpiresAtMillis.toString(),
       },
       android: {
         priority: 'high',
+        ttl: notificationTtlMillis,
       },
       apns: {
+        headers: {
+          'apns-expiration': Math.floor(
+            ringingExpiresAtMillis / 1000
+          ).toString(),
+        },
         payload: {
           aps: {
             sound: 'default',
@@ -9206,15 +9234,59 @@ export const startCall = regionalFunctions.https.onCall(
         throw callUnavailableError();
       }
 
-      if (activeCallSnap.exists) {
-        const activeCallId = activeCallSnap.data()?.callId;
-        if (typeof activeCallId === 'string' && activeCallId.length > 0) {
-          const activeCallSnap = await tx.get(db.collection('calls').doc(activeCallId));
-          const activeStatus = activeCallSnap.data()?.status;
-          if (activeStatus === 'ringing' || activeStatus === 'accepted') {
-            throw callClosedError();
-          }
-        }
+      const priorActiveCallId = activeCallSnap.data()?.callId;
+      const priorCallSnap =
+        typeof priorActiveCallId === 'string' &&
+        priorActiveCallId.length > 0
+          ? await tx.get(db.collection('calls').doc(priorActiveCallId))
+          : null;
+      const priorCallData = priorCallSnap?.data() ?? {};
+      const activeCallData = activeCallSnap.data() ?? {};
+      const now = admin.firestore.Timestamp.now();
+      const replacement = decideActiveCallReplacement({
+        pointerExists: activeCallSnap.exists,
+        callExists: priorCallSnap?.exists === true,
+        callBelongsToRoom:
+          priorCallData.callId === priorActiveCallId &&
+          priorCallData.matchId === matchId &&
+          isExactDirectChatParticipants(
+            priorCallData.participantUids,
+            userIds
+          ) &&
+          activeCallData.matchId === matchId &&
+          isExactDirectChatParticipants(
+            activeCallData.participantUids,
+            userIds
+          ) &&
+          activeCallData.status === priorCallData.status,
+        status: priorCallData.status,
+        ringingExpiresAtMillis:
+          priorCallData.ringingExpiresAt?.toMillis?.() ?? null,
+        paidUntilAtMillis: priorCallData.paidUntilAt?.toMillis?.() ?? null,
+        nowMillis: now.toMillis(),
+      });
+      if (replacement === 'busy') throw callClosedError();
+
+      const ringingExpiresAt = admin.firestore.Timestamp.fromMillis(
+        now.toMillis() + callRingingTtlSeconds * 1000
+      );
+      if (replacement === 'close-stale-ringing' && priorCallSnap != null) {
+        tx.update(priorCallSnap.ref, {
+          status: 'missed',
+          endedAt: now,
+          endedReason: 'ringing_expired',
+          updatedAt: now,
+        });
+      } else if (
+        replacement === 'close-expired-accepted' &&
+        priorCallSnap != null
+      ) {
+        tx.update(priorCallSnap.ref, {
+          status: 'ended',
+          endedAt: now,
+          endedReason: 'paid_entitlement_expired',
+          updatedAt: now,
+        });
       }
 
       const currentPoints = (userSnap.data()?.keyCount as number) ?? 0;
@@ -9241,6 +9313,7 @@ export const startCall = regionalFunctions.https.onCall(
         type,
         status: 'ringing',
         roomName,
+        ringingExpiresAt,
         paidUntilAt: null,
         segmentSeconds: null,
         extensionCount: 0,
@@ -9248,8 +9321,8 @@ export const startCall = regionalFunctions.https.onCall(
         initialChargePoints: chargePoints,
         callerDisplayName: callerData.displayName ?? '',
         calleeDisplayName: targetData.displayName ?? '',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: now,
+        updatedAt: now,
       };
       tx.set(callRef, callPayload);
       tx.set(activeCallRef, {
@@ -9257,7 +9330,8 @@ export const startCall = regionalFunctions.https.onCall(
         matchId,
         participantUids: userIds,
         status: 'ringing',
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ringingExpiresAt,
+        updatedAt: now,
       });
 
       return {
@@ -9266,6 +9340,7 @@ export const startCall = regionalFunctions.https.onCall(
         paidUntilAtMillis: null,
         chargePoints: 0,
         freeSegment: voiceFreeAvailable,
+        ringingExpiresAtMillis: ringingExpiresAt.toMillis(),
       };
     });
 
@@ -9286,6 +9361,7 @@ export const startCall = regionalFunctions.https.onCall(
       rtcUid: 0,
       tokenExpiresAt: null,
       paidUntilAt: result.paidUntilAtMillis,
+      ringingExpiresAt: result.ringingExpiresAtMillis,
       chargedPoints: result.chargePoints,
       freeSegment: result.freeSegment,
     };
@@ -9324,6 +9400,7 @@ export const acceptCall = regionalFunctions.https.onCall(
           appCertificate,
           channelName: entitlement.roomName,
           uid,
+          callType: entitlement.callType,
           paidUntilAtMillis,
         });
         return {
@@ -9374,6 +9451,7 @@ export const acceptCall = regionalFunctions.https.onCall(
         appCertificate,
         channelName: entitlement.roomName,
         uid,
+        callType: entitlement.callType,
         paidUntilAtMillis: paidUntilAt.toMillis(),
       });
 
@@ -9414,6 +9492,7 @@ export const acceptCall = regionalFunctions.https.onCall(
       tx.update(callRef, {
         status: 'accepted',
         acceptedAt: now,
+        ringingExpiresAt: admin.firestore.FieldValue.delete(),
         paidUntilAt,
         segmentSeconds,
         freeSegment: voiceFreeAvailable,
@@ -9425,6 +9504,7 @@ export const acceptCall = regionalFunctions.https.onCall(
         matchId: entitlement.matchId,
         participantUids: callData.participantUids ?? [],
         status: 'accepted',
+        ringingExpiresAt: admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
 
@@ -9477,6 +9557,7 @@ export const refreshCallToken = regionalFunctions.https.onCall(
         appCertificate,
         channelName: entitlement.roomName,
         uid,
+        callType: entitlement.callType,
         paidUntilAtMillis,
       });
       return {
@@ -9638,9 +9719,27 @@ export const extendCall = regionalFunctions.https.onCall(
     if (typeof callId !== 'string' || callId.length === 0) {
       throw new functions.https.HttpsError('invalid-argument', 'callId required');
     }
+    const clientRequestId = normalizeCallExtensionRequestId(
+      data.clientRequestId
+    );
+    if (clientRequestId == null) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'clientRequestId is invalid'
+      );
+    }
 
     const { appId, appCertificate } = agoraConfig();
     const callRef = db.collection('calls').doc(callId);
+    const operationId = callExtensionOperationId({
+      callId,
+      uid,
+      clientRequestId,
+    });
+    const operationRef = callRef
+      .collection('extensionOperations')
+      .doc(operationId);
+    const pointEventRef = db.collection('pointEvents').doc(operationId);
     const result = await db.runTransaction(async (tx) => {
       const entitlement = await requireCallEntitlement(tx, {
         callRef,
@@ -9649,6 +9748,76 @@ export const extendCall = regionalFunctions.https.onCall(
         allowedStatuses: ['accepted'],
         requirePaidEntitlement: true,
       });
+      const [operationSnap, pointEventSnap] = await Promise.all([
+        tx.get(operationRef),
+        tx.get(pointEventRef),
+      ]);
+      const operationData = operationSnap.data();
+      const pointEventData = pointEventSnap.data();
+      const replay = decideCallExtensionReplay({
+        operationExists: operationSnap.exists,
+        operation: operationData == null ? undefined : {
+          operationId: operationData.operationId,
+          callId: operationData.callId,
+          uid: operationData.uid,
+          clientRequestId: operationData.clientRequestId,
+          matchId: operationData.matchId,
+          callType: operationData.callType,
+          roomName: operationData.roomName,
+          paidUntilAtMillis:
+            operationData.paidUntilAt?.toMillis?.() ?? null,
+          chargedPoints: operationData.chargedPoints,
+          keyCount: operationData.keyCount,
+          pointEventId: operationData.pointEventId,
+          status: operationData.status,
+        },
+        eventExists: pointEventSnap.exists,
+        event: pointEventData == null ? undefined : {
+          uid: pointEventData.uid,
+          callId: pointEventData.callId,
+          matchId: pointEventData.matchId,
+          eventType: pointEventData.eventType,
+          source: pointEventData.source,
+          reason: pointEventData.reason,
+          amount: pointEventData.amount,
+          balanceBefore: pointEventData.balanceBefore,
+          balanceAfter: pointEventData.balanceAfter,
+          clientRequestId: pointEventData.clientRequestId,
+        },
+        expected: {
+          operationId,
+          callId,
+          uid,
+          clientRequestId,
+          matchId: entitlement.matchId,
+          callType: entitlement.callType,
+          roomName: entitlement.roomName,
+        },
+      });
+      if (replay.action === 'inconsistent') throw callClosedError();
+      if (replay.action === 'replay') {
+        if (
+          replay.paidUntilAtMillis > entitlement.paidUntilAtMillis!
+        ) throw callClosedError();
+        const token = buildAgoraRtcToken({
+          appId,
+          appCertificate,
+          channelName: entitlement.roomName,
+          uid,
+          callType: entitlement.callType,
+          paidUntilAtMillis: replay.paidUntilAtMillis,
+        });
+        return {
+          roomName: entitlement.roomName,
+          paidUntilAtMillis: replay.paidUntilAtMillis,
+          chargedPoints: replay.chargedPoints,
+          keyCount: replay.keyCount,
+          freeSegment: entitlement.callData.freeSegment === true,
+          token,
+          idempotentReplay: true,
+        };
+      }
+
       const decision = decideCallExtension({
         callType: entitlement.callType,
         currentBalance: entitlement.requesterAccountSnap.data()?.keyCount,
@@ -9667,6 +9836,7 @@ export const extendCall = regionalFunctions.https.onCall(
         appCertificate,
         channelName: entitlement.roomName,
         uid,
+        callType: entitlement.callType,
         paidUntilAtMillis: decision.nextPaidUntilAtMillis,
       });
 
@@ -9679,9 +9849,9 @@ export const extendCall = regionalFunctions.https.onCall(
         extensionCount: admin.firestore.FieldValue.increment(1),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      const pointEventRef = db.collection('pointEvents').doc();
-      tx.set(pointEventRef, {
+      tx.create(pointEventRef, {
         uid,
+        callId,
         eventType: 'consume',
         amount: decision.chargePoints,
         reason: entitlement.callType === 'video'
@@ -9692,8 +9862,24 @@ export const extendCall = regionalFunctions.https.onCall(
         balanceAfter: decision.nextBalance,
         matchId: entitlement.matchId,
         source: 'extendCall',
+        clientRequestId,
         timestamp: entitlement.now,
       } as QuotaEventData);
+      tx.create(operationRef, {
+        operationId,
+        callId,
+        uid,
+        clientRequestId,
+        matchId: entitlement.matchId,
+        callType: entitlement.callType,
+        roomName: entitlement.roomName,
+        status: 'committed',
+        paidUntilAt: nextPaidUntilAt,
+        chargedPoints: decision.chargePoints,
+        keyCount: decision.nextBalance,
+        pointEventId: operationId,
+        createdAt: entitlement.now,
+      });
 
       return {
         roomName: entitlement.roomName,
@@ -9702,6 +9888,7 @@ export const extendCall = regionalFunctions.https.onCall(
         keyCount: decision.nextBalance,
         freeSegment: entitlement.callData.freeSegment === true,
         token,
+        idempotentReplay: false,
       };
     });
 
@@ -9717,6 +9904,8 @@ export const extendCall = regionalFunctions.https.onCall(
       chargedPoints: result.chargedPoints,
       keyCount: result.keyCount,
       freeSegment: result.freeSegment,
+      clientRequestId,
+      idempotentReplay: result.idempotentReplay,
     };
   }
 );
