@@ -63,6 +63,11 @@ test('shared entitlement loader reads every mutable authorization edge', () => {
     assert.ok(helper.includes(requiredRead), `missing ${requiredRead}`);
   }
   assert.match(helper, /callEntitlementIssue\(/);
+  assert.match(helper, /matchPairKey:\s*matchData\.pairKey/);
+  assert.match(helper, /pairId:\s*pairSnap\.id/);
+  assert.match(helper, /pairPairKey:\s*pairData\.pairKey/);
+  assert.match(helper, /pairClosedMatchId:\s*pairData\.closedMatchId/);
+  assert.match(helper, /pairClosedReason:\s*pairData\.closedReason/);
   assert.match(helper, /throw callClosedError\(\)/);
   assert.match(helper, /throw callUnavailableError\(\)/);
 });
@@ -96,7 +101,9 @@ test('startCall never grants RTC privileges before acceptance and payment', () =
   assert.match(callable, /token:\s*''/);
   assert.match(callable, /tokenExpiresAt:\s*null/);
   assert.match(callable, /directRoomVersion !== 1/);
-  assert.match(callable, /pairSnap\.data\(\)\?\.activeMatchId !== matchId/);
+  assert.match(callable, /reusableDirectRoomSnapshots\(\{/);
+  assert.match(callable, /expectedUserIds:\s*userIds/);
+  assert.match(callable, /pairKey,/);
   assert.match(callable, /callerUid:\s*uid/);
   assert.match(callable, /decideActiveCallReplacement\(/);
   assert.match(callable, /priorCallData\.callId === priorActiveCallId/);

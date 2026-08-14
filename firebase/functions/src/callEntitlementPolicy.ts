@@ -38,11 +38,16 @@ export interface CallEntitlementPolicyInput {
   matchExists: boolean;
   matchActive: boolean;
   matchParticipantUids: unknown;
+  matchPairKey: unknown;
   matchDirectRoomVersion: unknown;
   matchHiddenFor: unknown;
   pairExists: boolean;
+  pairId: string;
+  pairPairKey: unknown;
   pairActiveMatchId: unknown;
   pairParticipantUids: unknown;
+  pairClosedMatchId: unknown;
+  pairClosedReason: unknown;
   callerBlockedCallee: boolean;
   calleeBlockedCaller: boolean;
   activeCallExists: boolean;
@@ -87,6 +92,9 @@ export function callEntitlementIssue(
   ) {
     return 'unavailable';
   }
+  const expectedPairKey = [input.callerUid, input.calleeUid]
+    .sort()
+    .join('_');
 
   if (
     !input.allowedStatuses.includes(input.callStatus as JoinableCallStatus) ||
@@ -119,15 +127,20 @@ export function callEntitlementIssue(
       input.matchParticipantUids,
       [input.callerUid, input.calleeUid]
     ) ||
+    input.matchPairKey !== expectedPairKey ||
     input.matchDirectRoomVersion !== 1 ||
     !Array.isArray(input.matchHiddenFor) ||
     input.matchHiddenFor.length !== 0 ||
     !input.pairExists ||
+    input.pairId !== expectedPairKey ||
+    input.pairPairKey !== expectedPairKey ||
     input.pairActiveMatchId !== input.callMatchId ||
     !isExactDirectChatParticipants(
       input.pairParticipantUids,
       [input.callerUid, input.calleeUid]
     ) ||
+    input.pairClosedMatchId !== undefined ||
+    input.pairClosedReason !== undefined ||
     input.callerBlockedCallee ||
     input.calleeBlockedCaller
   ) {

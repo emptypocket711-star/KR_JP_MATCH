@@ -43,11 +43,16 @@ function entitlement(overrides = {}) {
     matchExists: true,
     matchActive: true,
     matchParticipantUids: ['bob', 'alice'],
+    matchPairKey: 'alice_bob',
     matchDirectRoomVersion: 1,
     matchHiddenFor: [],
     pairExists: true,
+    pairId: 'alice_bob',
+    pairPairKey: 'alice_bob',
     pairActiveMatchId: 'match-1',
     pairParticipantUids: ['bob', 'alice'],
+    pairClosedMatchId: undefined,
+    pairClosedReason: undefined,
     callerBlockedCallee: false,
     calleeBlockedCaller: false,
     activeCallExists: true,
@@ -109,10 +114,26 @@ test('rejects hidden, legacy, inactive, unavailable, or blocked room graphs gene
     { matchHiddenFor: ['alice'] },
     { matchHiddenFor: ['bob'] },
     { pairExists: false },
-    { pairActiveMatchId: 'replacement-match' },
     { pairParticipantUids: ['alice', 'mallory'] },
     { callerBlockedCallee: true },
     { calleeBlockedCaller: true },
+  ]) {
+    assert.equal(callEntitlementIssue(entitlement(overrides)), 'unavailable');
+  }
+});
+
+test('requires the exact canonical current-room pointer without closure residue', () => {
+  for (const overrides of [
+    { matchPairKey: undefined },
+    { matchPairKey: 'alice_mallory' },
+    { pairId: 'alice_mallory' },
+    { pairPairKey: undefined },
+    { pairPairKey: 'alice_mallory' },
+    { pairActiveMatchId: 'replacement-match' },
+    { pairClosedMatchId: 'historical-match' },
+    { pairClosedMatchId: null },
+    { pairClosedReason: 'left_chat' },
+    { pairClosedReason: null },
   ]) {
     assert.equal(callEntitlementIssue(entitlement(overrides)), 'unavailable');
   }

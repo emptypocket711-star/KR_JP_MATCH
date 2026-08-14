@@ -1698,11 +1698,16 @@ async function requireCallEntitlement(
     matchExists: matchSnap.exists,
     matchActive: matchData.isActive === true,
     matchParticipantUids: matchData.userIds,
+    matchPairKey: matchData.pairKey,
     matchDirectRoomVersion: matchData.directRoomVersion,
     matchHiddenFor: matchData.hiddenFor,
     pairExists: pairSnap.exists,
+    pairId: pairSnap.id,
+    pairPairKey: pairData.pairKey,
     pairActiveMatchId: pairData.activeMatchId,
     pairParticipantUids: pairData.userIds,
+    pairClosedMatchId: pairData.closedMatchId,
+    pairClosedReason: pairData.closedReason,
     callerBlockedCallee: callerBlockSnap.exists,
     calleeBlockedCaller: calleeBlockSnap.exists,
     activeCallExists: activeCallSnap.exists,
@@ -9626,9 +9631,13 @@ export const startCall = regionalFunctions.https.onCall(
         throw callUnavailableError();
       }
       if (
-        !pairSnap.exists ||
-        pairSnap.data()?.activeMatchId !== matchId ||
-        !isExactDirectChatParticipants(pairSnap.data()?.userIds, userIds) ||
+        !reusableDirectRoomSnapshots({
+          matchId,
+          matchSnap,
+          pairSnap,
+          expectedUserIds: userIds,
+          pairKey,
+        }) ||
         callerBlockSnap.exists ||
         targetBlockSnap.exists
       ) {
