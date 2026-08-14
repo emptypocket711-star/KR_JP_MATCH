@@ -45,11 +45,19 @@ hana-e2ee6
 Prefer the guarded scripts in `scripts/` instead of manually typing deploy
 commands.
 
-Before deploy work, verify project aliases and production deploy guards:
+Before deploy work, verify the rollout contract and the hermetic deploy-guard
+tests:
 
 ```bash
-scripts/validate_firebase_project_config.sh
+node scripts/validate_private_media_rollout_contract.js
+scripts/test_firebase_deploy_guards.sh
 ```
+
+There is no production environment validator or production deploy
+implementation in this change set. `scripts/deploy_prod_firebase.sh` is an
+executable deny-only sentinel and rejects every target before any CLI or cloud
+lookup. Production stays NO-GO until a separately reviewed transition PR
+replaces that sentinel and adds its executable artifact matrix.
 
 ## Pre-Deploy Checks
 
@@ -200,9 +208,11 @@ APP1-APP15/comment metadata, malformed/trailing markers, dimensions above
 replay. Because these are Gen 1 Functions with default Admin SDK credentials,
 the exact environment's App Engine default service account
 (`<project-id>@appspot.gserviceaccount.com`) must already have
-`roles/firebaseappcheck.tokenVerifier`. Both deploy scripts fail before a
-Functions deploy when that project IAM binding is absent; do not replace this
-read-only preflight with a local-source assertion.
+`roles/firebaseappcheck.tokenVerifier`. The staging deploy script fails before
+a Functions deploy when that project IAM binding is absent; do not replace this
+read-only preflight with a local-source assertion. The production deny-only
+sentinel performs no IAM lookup; its future reviewed replacement must add the
+same exact-project check.
 A generation-fenced scheduled cleanup deletes expired unconsumed objects only
 after a fresh transaction claim, so a stale query cannot delete consumed media.
 
@@ -279,9 +289,10 @@ rules artifact. Do not claim otherwise and do not deploy the strict
 `firebase/storage.rules` during the transition.
 
 This is a current production Functions deployment blocker, not a documentation
-placeholder. `scripts/deploy_prod_firebase.sh functions` exits before live
-inventory or deployment until all three separately reviewed files exist and
-their SHA-256 bindings validate:
+placeholder. The deny-only `scripts/deploy_prod_firebase.sh` exits before live
+inventory or deployment for every target. A future reviewed replacement must
+also refuse Functions until all three separately reviewed files exist and their
+SHA-256 bindings validate:
 
 - `firebase/storage.production.transitional.rules`
 - `firebase/test/storage.production.transitional.rules.test.js`
@@ -391,10 +402,13 @@ The strict Rules command is therefore not repeated after Functions. Continue
 with V2 APK installation, E2E, then the environment-bound legacy-finalize
 control and migration/drain.
 
-Production deploys are blocked unless the known production project ID is
-supplied explicitly. Deploy the reviewed index/TTL configuration first, wait
-for every index to report `READY`, and read-only verify the same three
-`expireAt` quota TTL policies are enabled on `hana-production-tokyo`:
+Production deploys are currently blocked unconditionally by the deny-only
+sentinel. The following commands document the intended future sequence; they
+all exit with code 64 in this change set and must not be treated as executable
+release instructions. After the separate production transition PR is reviewed,
+deploy the reviewed index/TTL configuration first, wait for every index to
+report `READY`, and read-only verify the same three `expireAt` quota TTL
+policies are enabled on `hana-production-tokyo`:
 
 ```bash
 HANA_PROD_FIREBASE_PROJECT=hana-production-tokyo \
@@ -431,11 +445,13 @@ HANA_CONFIRM_PRIVATE_MEDIA_STRICT_CUTOVER=hana-production-tokyo-private-media-st
   scripts/deploy_prod_firebase.sh firestore:rules,storage
 ```
 
-Both guarded deploy scripts resolve the Firebase Storage service agent for the
-exact target project and fail before deployment unless it has
-`roles/firebaserules.firestoreServiceAgent`. That cross-service IAM preflight
-only proves Storage Rules can read Firestore; it does not satisfy any rollout or
-production-approval gate above.
+The staging deploy script resolves the Firebase Storage service agent for the
+exact staging project and fails before deployment unless it has
+`roles/firebaserules.firestoreServiceAgent`. The current production sentinel
+performs no cloud lookup at all. Its eventual reviewed replacement must add the
+same exact-project IAM preflight. That cross-service IAM check only proves
+Storage Rules can read Firestore; it does not satisfy any rollout or production
+approval gate above.
 
 Do not set `HANA_PROD_FIREBASE_PROJECT` to `hana-e2ee6`; that project is
 staging.
@@ -449,12 +465,15 @@ The 2026-08-13 read-only inventories found staging exclusively in
 and repeat inventory immediately before every deployment; the recorded counts
 are not proof of later live state.
 
-Both deploy scripts run `firebase functions:list --project <exact-id> --json`
-and fail closed when the live set is empty, mixed, belongs to another project,
-or includes any other region. They also require the matching manual inventory
-acknowledgement (`us-central1` for staging, `asia-northeast1` for production)
-and export the exact environment/project/region tuple while loading Functions
-source. This acknowledgement is not permission to deploy.
+The staging deploy script runs
+`firebase functions:list --project hana-e2ee6 --json` and fails closed when the
+live set is empty, mixed, belongs to another project, or includes any region
+other than `us-central1`. It also requires the matching manual inventory
+acknowledgement and exports the exact staging environment/project/region tuple
+while loading Functions source. The production sentinel intentionally performs
+no inventory lookup. Its future reviewed replacement must implement the
+equivalent `hana-production-tokyo` / `asia-northeast1` guard. An inventory
+acknowledgement is not permission to deploy.
 
 Confirm new functions exist with the explicit project:
 

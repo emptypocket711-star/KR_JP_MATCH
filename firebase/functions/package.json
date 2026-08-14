@@ -7,7 +7,7 @@
     "build": "tsc",
     "test": "npm run build && node --test test/*.test.js",
     "serve": "firebase emulators:start --only functions",
-    "deploy": "firebase deploy --only functions",
+    "deploy": "../../scripts/deploy_staging_firebase.sh functions",
     "logs": "firebase functions:log",
     "lint": "eslint \"src/**/*.ts\""
   },
