@@ -35,13 +35,13 @@ if HANA_TEST_ROLE_PRESENT=false run_preflight hana-e2ee6 2>"$STDERR_LOG"; then
   echo "App Check IAM preflight accepted a missing verifier role." >&2
   exit 1
 fi
-rg -Fq 'App Check replay-protection IAM binding is missing.' "$STDERR_LOG"
+  grep -Fq 'App Check replay-protection IAM binding is missing.' "$STDERR_LOG"
 for token in \
   'gcloud projects get-iam-policy hana-e2ee6' \
   'bindings.role=roles/firebaseappcheck.tokenVerifier' \
   'serviceAccount:hana-e2ee6@appspot.gserviceaccount.com'
 do
-  rg -Fq "$token" "$CALL_LOG"
+  grep -Fq "$token" "$CALL_LOG"
 done
 
 : > "$CALL_LOG"
@@ -50,7 +50,7 @@ for token in \
   'gcloud projects get-iam-policy hana-production-tokyo' \
   'serviceAccount:hana-production-tokyo@appspot.gserviceaccount.com'
 do
-  rg -Fq "$token" "$CALL_LOG"
+  grep -Fq "$token" "$CALL_LOG"
 done
 
 : > "$CALL_LOG"
