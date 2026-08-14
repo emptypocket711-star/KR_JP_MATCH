@@ -99,6 +99,7 @@ import { deprecatedLikeResult } from './legacyDiscoveryPolicy';
 import {
   decideInitialOnboardingPointGrant,
   onboardingCompletionBlockReason,
+  onboardingPointEventExplainsBalance,
   onboardingPointEventId,
   validateOnboardingProfileInput,
 } from './onboardingPolicy';
@@ -142,12 +143,15 @@ import {
   dailyLoungePostPointGrantAmount,
   isAlreadyGrantedPlayPurchaseRecord,
   isStorePointPurchaseEnabled,
+  isValidPointBalance,
   isValidPointPlatform,
   isValidPurchaseToken,
   kstDateKey,
   pointAmountForProduct,
   pointBalanceAfterConsume,
   pointBalanceAfterGrant,
+  pointBalanceTrustIssue,
+  pointBalanceTrustVersion,
   shouldGrantDailyLoungePostPoints,
   shouldVerifyPlayBilling,
 } from './pointPolicy';
@@ -299,6 +303,45 @@ interface StorePointPurchaseRequest {
   appAccountToken?: string;
 }
 
+function pointBalanceReviewRequired(): never {
+  throw new functions.https.HttpsError(
+    'failed-precondition',
+    'Point balance requires account review'
+  );
+}
+
+function requireTrustedPointBalance(
+  userData: Record<string, unknown> | undefined
+): number {
+  if (pointBalanceTrustIssue(userData) !== null) {
+    return pointBalanceReviewRequired();
+  }
+  const balance = userData?.keyCount;
+  if (!isValidPointBalance(balance)) {
+    return pointBalanceReviewRequired();
+  }
+  return balance;
+}
+
+function pointBalanceForServerGrant(
+  userData: Record<string, unknown> | undefined
+): number {
+  const issue = pointBalanceTrustIssue(userData);
+  if (issue === null) return requireTrustedPointBalance(userData);
+
+  const balance = userData?.keyCount;
+  if (
+    issue === 'untrusted-balance' &&
+    userData?.pointBalanceTrustVersion === undefined &&
+    userData?.pointBalanceQuarantined !== true &&
+    balance === 0 &&
+    isValidPointBalance(balance)
+  ) {
+    return balance;
+  }
+  return pointBalanceReviewRequired();
+}
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -442,7 +485,7 @@ async function verifyAndGrantAppleStorePointPurchase(
         existingTransaction.uid === uid &&
         existingTransaction.productId === data.productId
       ) {
-        const keyCount = (userData?.keyCount as number) ?? 0;
+        const keyCount = requireTrustedPointBalance(userData);
         return { keyCount, alreadyProcessed: true };
       }
       throw new functions.https.HttpsError(
@@ -451,7 +494,7 @@ async function verifyAndGrantAppleStorePointPurchase(
       );
     }
 
-    const currentKeyCount = (userData?.keyCount as number) ?? 0;
+    const currentKeyCount = pointBalanceForServerGrant(userData);
     const nextKeyCount = pointBalanceAfterGrant(
       currentKeyCount,
       productPoints
@@ -470,7 +513,8 @@ async function verifyAndGrantAppleStorePointPurchase(
     };
 
     tx.update(userRef, {
-      keyCount: admin.firestore.FieldValue.increment(productPoints),
+      keyCount: nextKeyCount,
+      pointBalanceTrustVersion,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     tx.create(transactionRef, {
@@ -575,8 +619,10 @@ async function verifyAndGrantGooglePlayPointPurchase(
       purchaseSnap.exists &&
       isAlreadyGrantedPlayPurchaseRecord(purchaseData, uid)
     ) {
+      requireTrustedPointBalance(userSnap.data());
       return 'granted' as const;
     }
+    pointBalanceForServerGrant(userSnap.data());
     const leaseUntilMillis =
       purchaseData?.leaseUntil instanceof admin.firestore.Timestamp
         ? purchaseData.leaseUntil.toMillis()
@@ -650,7 +696,7 @@ async function verifyAndGrantGooglePlayPointPurchase(
     return {
       ok: true,
       extraQuotaGranted: 0,
-      keyCount: (currentUser.data()?.keyCount as number) ?? 0,
+      keyCount: requireTrustedPointBalance(currentUser.data()),
       alreadyProcessed: true,
     };
   }
@@ -736,9 +782,10 @@ async function verifyAndGrantGooglePlayPointPurchase(
       );
     }
     if (freshPurchaseSnap.data()?.status === 'granted') {
+      const currentKeyCount = requireTrustedPointBalance(freshUserData);
       return {
-        previousKeyCount: (freshUserData?.keyCount as number) ?? 0,
-        keyCount: (freshUserData?.keyCount as number) ?? 0,
+        previousKeyCount: currentKeyCount,
+        keyCount: currentKeyCount,
         alreadyProcessed: true,
       };
     }
@@ -752,7 +799,7 @@ async function verifyAndGrantGooglePlayPointPurchase(
       );
     }
 
-    const currentKeyCount = (freshUserData?.keyCount as number) ?? 0;
+    const currentKeyCount = pointBalanceForServerGrant(freshUserData);
     const nextKeyCount = pointBalanceAfterGrant(
       currentKeyCount,
       productPoints
@@ -772,7 +819,8 @@ async function verifyAndGrantGooglePlayPointPurchase(
     };
 
     tx.update(userRef, {
-      keyCount: admin.firestore.FieldValue.increment(productPoints),
+      keyCount: nextKeyCount,
+      pointBalanceTrustVersion,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     tx.update(purchaseRef, {
@@ -5154,12 +5202,38 @@ export const completeOnboarding = regionalFunctions.https.onCall(
         );
       }
 
-      if (pointGrantDecision.action !== 'none') {
-        if (pointGrantDecision.action === 'grant') {
-          profileUpdate.keyCount = admin.firestore.FieldValue.increment(
-            pointGrantDecision.amount
+      const existingPointTrustIssue = pointBalanceTrustIssue(userData);
+      if (existingPointTrustIssue === 'quarantined-balance') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Point balance requires account review'
+        );
+      }
+      if (
+        pointGrantDecision.action === 'none' &&
+        existingPointTrustIssue !== null
+      ) {
+        if (
+          existingPointTrustIssue !== 'untrusted-balance' ||
+          !onboardingPointEventExplainsBalance({
+            uid,
+            currentKeyCount: userData?.keyCount,
+            eventData: initialPointEventSnap.data(),
+          })
+        ) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'Point balance requires account review'
           );
         }
+        profileUpdate.pointBalanceTrustVersion = pointBalanceTrustVersion;
+      }
+
+      if (pointGrantDecision.action !== 'none') {
+        if (pointGrantDecision.action === 'grant') {
+          profileUpdate.keyCount = pointGrantDecision.balanceAfter;
+        }
+        profileUpdate.pointBalanceTrustVersion = pointBalanceTrustVersion;
         tx.set(initialPointEventRef, {
           uid,
           eventType: 'grant',
@@ -8008,11 +8082,13 @@ export const createLoungePost = regionalFunctions.https.onCall(
       const freshPhotoUrls = Array.isArray(freshUserData.photoUrls)
         ? freshUserData.photoUrls
         : [];
-      const currentKeyCount = (freshUserData.keyCount as number) ?? 0;
       const shouldGrant = shouldGrantDailyLoungePostPoints(
         freshUserData.lastLoungePostPointGrantDate,
         todayKey
       );
+      const currentKeyCount = shouldGrant
+        ? pointBalanceForServerGrant(freshUserData)
+        : requireTrustedPointBalance(freshUserData);
       const nextKeyCount = shouldGrant
         ? pointBalanceAfterGrant(currentKeyCount, dailyLoungePostPointGrantAmount)
         : currentKeyCount;
@@ -8035,9 +8111,8 @@ export const createLoungePost = regionalFunctions.https.onCall(
       if (shouldGrant) {
         const pointEventRef = db.collection('pointEvents').doc();
         tx.update(userRef, {
-          keyCount: admin.firestore.FieldValue.increment(
-            dailyLoungePostPointGrantAmount
-          ),
+          keyCount: nextKeyCount,
+          pointBalanceTrustVersion,
           lastLoungePostPointGrantDate: todayKey,
           lastLoungePostPointGrantAt: admin.firestore.FieldValue.serverTimestamp(),
         });
@@ -9320,7 +9395,6 @@ export const startChat = regionalFunctions.https.onCall(
         tx.get(callerBlockRef),
         tx.get(targetBlockRef),
       ]);
-      const currentPoints = (freshUser.data()?.keyCount as number) ?? 0;
 
       if (activeAccountIssue({
         exists: freshUser.exists,
@@ -9338,6 +9412,7 @@ export const startChat = regionalFunctions.https.onCall(
 
       const freshTargetData = freshTarget.data() ?? {};
       const freshUserData = freshUser.data() ?? {};
+      const currentPoints = requireTrustedPointBalance(freshUserData);
       if (!isEligibleExternalProfileViewer(freshUserData)) {
         throw new functions.https.HttpsError(
           'failed-precondition',
@@ -9393,8 +9468,9 @@ export const startChat = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('resource-exhausted', '포인트가 부족합니다');
       }
 
+      const nextPointBalance = pointBalanceAfterConsume(currentPoints, 1);
       tx.update(userRef, {
-        keyCount: admin.firestore.FieldValue.increment(-1),
+        keyCount: nextPointBalance,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -9445,7 +9521,7 @@ export const startChat = regionalFunctions.https.onCall(
         amount: 1,
         reason: 'new_direct_chat',
         balanceBefore: currentPoints,
-        balanceAfter: pointBalanceAfterConsume(currentPoints, 1),
+        balanceAfter: nextPointBalance,
         matchId,
         pairKey,
         source: 'startChat',
@@ -9626,7 +9702,7 @@ export const startCall = regionalFunctions.https.onCall(
         });
       }
 
-      const currentPoints = (userSnap.data()?.keyCount as number) ?? 0;
+      const currentPoints = requireTrustedPointBalance(userSnap.data());
       const voiceFreeAvailable =
         type === 'voice' && quotaSnap.data()?.freeVoiceCallUsed !== true;
       const chargePoints = type === 'video'
@@ -9724,6 +9800,9 @@ export const acceptCall = regionalFunctions.https.onCall(
         requirePaidEntitlement: false,
       });
       const callData = entitlement.callData;
+      const currentPoints = requireTrustedPointBalance(
+        entitlement.callerAccountSnap.data()
+      );
       if (callData.status === 'accepted') {
         const paidUntilAtMillis = entitlement.paidUntilAtMillis;
         if (
@@ -9771,11 +9850,7 @@ export const acceptCall = regionalFunctions.https.onCall(
         : voiceFreeAvailable
           ? VOICE_FREE_SECONDS
           : VOICE_EXTENSION_SECONDS;
-      const currentPoints = entitlement.callerAccountSnap.data()?.keyCount;
-      if (
-        !Number.isSafeInteger(currentPoints) ||
-        currentPoints < chargePoints
-      ) {
+      if (currentPoints < chargePoints) {
         throw new functions.https.HttpsError('resource-exhausted', '포인트가 부족합니다');
       }
 
@@ -9793,8 +9868,12 @@ export const acceptCall = regionalFunctions.https.onCall(
       });
 
       if (chargePoints > 0) {
+        const nextPointBalance = pointBalanceAfterConsume(
+          currentPoints,
+          chargePoints
+        );
         tx.update(entitlement.callerRef, {
-          keyCount: admin.firestore.FieldValue.increment(-chargePoints),
+          keyCount: nextPointBalance,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
         const pointEventRef = db.collection('pointEvents').doc();
@@ -9806,7 +9885,7 @@ export const acceptCall = regionalFunctions.https.onCall(
             ? 'video_call_segment'
             : 'voice_call_segment',
           balanceBefore: currentPoints,
-          balanceAfter: pointBalanceAfterConsume(currentPoints, chargePoints),
+          balanceAfter: nextPointBalance,
           matchId: entitlement.matchId,
           source: 'acceptCall',
           timestamp: now,
@@ -10155,9 +10234,12 @@ export const extendCall = regionalFunctions.https.onCall(
         };
       }
 
+      const currentPoints = requireTrustedPointBalance(
+        entitlement.requesterAccountSnap.data()
+      );
       const decision = decideCallExtension({
         callType: entitlement.callType,
-        currentBalance: entitlement.requesterAccountSnap.data()?.keyCount,
+        currentBalance: currentPoints,
         paidUntilAtMillis: entitlement.paidUntilAtMillis,
         nowMillis: entitlement.now.toMillis(),
       });
@@ -10178,7 +10260,7 @@ export const extendCall = regionalFunctions.https.onCall(
       });
 
       tx.update(entitlement.requesterRef, {
-        keyCount: admin.firestore.FieldValue.increment(-decision.chargePoints),
+        keyCount: decision.nextBalance,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       tx.update(callRef, {
@@ -10194,8 +10276,7 @@ export const extendCall = regionalFunctions.https.onCall(
         reason: entitlement.callType === 'video'
           ? 'video_call_extension'
           : 'voice_call_extension',
-        balanceBefore:
-          entitlement.requesterAccountSnap.data()!.keyCount as number,
+        balanceBefore: currentPoints,
         balanceAfter: decision.nextBalance,
         matchId: entitlement.matchId,
         source: 'extendCall',

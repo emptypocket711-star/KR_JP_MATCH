@@ -6,6 +6,7 @@ const {
   hasValidAdultIdentity,
   initialOnboardingPointGrantAmount,
   onboardingCompletionBlockReason,
+  onboardingPointEventExplainsBalance,
   onboardingPointEventId,
   profileMediaVisibilityVersion,
   validateOnboardingProfileInput,
@@ -104,6 +105,78 @@ test('trusts only zero legacy balance and quarantines unexplained balances', () 
       currentKeyCount: undefined,
     })
   );
+});
+
+test('accepts only an exact server-owned onboarding event as balance evidence', () => {
+  const grant = {
+    uid: 'alice',
+    eventType: 'grant',
+    amount: 3,
+    balanceBefore: 0,
+    balanceAfter: 3,
+    source: 'onboarding_v1',
+    migrationMarker: false,
+    legacyBalancePreserved: false,
+  };
+  assert.equal(
+    onboardingPointEventExplainsBalance({
+      uid: 'alice',
+      currentKeyCount: 3,
+      eventData: grant,
+    }),
+    true
+  );
+  assert.equal(
+    onboardingPointEventExplainsBalance({
+      uid: 'alice',
+      currentKeyCount: 4,
+      eventData: grant,
+    }),
+    false
+  );
+  assert.equal(
+    onboardingPointEventExplainsBalance({
+      uid: 'bob',
+      currentKeyCount: 3,
+      eventData: grant,
+    }),
+    false
+  );
+
+  const marker = {
+    uid: 'alice',
+    eventType: 'grant',
+    amount: 0,
+    balanceBefore: 0,
+    balanceAfter: 0,
+    source: 'onboarding_legacy_balance_v1',
+    migrationMarker: true,
+    legacyBalancePreserved: true,
+  };
+  assert.equal(
+    onboardingPointEventExplainsBalance({
+      uid: 'alice',
+      currentKeyCount: 0,
+      eventData: marker,
+    }),
+    true
+  );
+  for (const eventData of [
+    undefined,
+    { ...grant, amount: 4 },
+    { ...grant, balanceBefore: 1 },
+    { ...grant, source: 'client' },
+    { ...marker, legacyBalancePreserved: false },
+  ]) {
+    assert.equal(
+      onboardingPointEventExplainsBalance({
+        uid: 'alice',
+        currentKeyCount: eventData === marker ? 0 : 3,
+        eventData,
+      }),
+      false
+    );
+  }
 });
 
 test('blocks completed users only after a fully usable profile is present', () => {

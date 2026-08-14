@@ -107,6 +107,40 @@ export function onboardingPointEventId(uid: string): string {
   return `onboarding:${normalizedUid}:v1`;
 }
 
+export function onboardingPointEventExplainsBalance(input: {
+  uid: string;
+  currentKeyCount: unknown;
+  eventData: Record<string, unknown> | undefined;
+}): boolean {
+  const { eventData } = input;
+  if (
+    !isValidPointBalance(input.currentKeyCount) ||
+    eventData?.uid !== input.uid ||
+    eventData.eventType !== 'grant' ||
+    eventData.balanceBefore !== 0 ||
+    eventData.balanceAfter !== input.currentKeyCount
+  ) {
+    return false;
+  }
+
+  if (eventData.source === 'onboarding_v1') {
+    return (
+      eventData.amount === initialOnboardingPointGrantAmount &&
+      input.currentKeyCount === initialOnboardingPointGrantAmount &&
+      eventData.migrationMarker === false &&
+      eventData.legacyBalancePreserved === false
+    );
+  }
+
+  return (
+    eventData.source === 'onboarding_legacy_balance_v1' &&
+    eventData.amount === 0 &&
+    input.currentKeyCount === 0 &&
+    eventData.migrationMarker === true &&
+    eventData.legacyBalancePreserved === true
+  );
+}
+
 export function decideInitialOnboardingPointGrant(input: {
   initialPointEventExists: boolean;
   currentKeyCount: unknown;

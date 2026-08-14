@@ -71,8 +71,11 @@ export function isValidPointBalance(value: unknown): value is number {
 
 export function pointBalanceTrustIssue(
   userData: Record<string, unknown> | undefined
-): 'invalid-balance' | 'untrusted-balance' | null {
+): 'invalid-balance' | 'quarantined-balance' | 'untrusted-balance' | null {
   if (!isValidPointBalance(userData?.keyCount)) return 'invalid-balance';
+  if (userData?.pointBalanceQuarantined === true) {
+    return 'quarantined-balance';
+  }
   if (userData?.pointBalanceTrustVersion !== pointBalanceTrustVersion) {
     return 'untrusted-balance';
   }

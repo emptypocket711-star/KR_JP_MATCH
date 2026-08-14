@@ -147,6 +147,14 @@ test('requires the server-owned point balance trust marker before spending', () 
   assert.equal(pointBalanceTrustIssue({ keyCount: 3 }), 'untrusted-balance');
   assert.equal(
     pointBalanceTrustIssue({
+      keyCount: 3,
+      pointBalanceTrustVersion,
+      pointBalanceQuarantined: true,
+    }),
+    'quarantined-balance'
+  );
+  assert.equal(
+    pointBalanceTrustIssue({
       keyCount: Number.NaN,
       pointBalanceTrustVersion,
     }),
