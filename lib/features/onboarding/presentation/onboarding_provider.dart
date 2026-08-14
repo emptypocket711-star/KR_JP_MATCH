@@ -15,6 +15,8 @@ class OnboardingFormState {
   final String relationshipType;
   final String displayName;
   final int? birthYear;
+  final int? birthMonth;
+  final int? birthDay;
   final String? gender;
   final String? nationality;
   final String? residingCountry;
@@ -34,6 +36,8 @@ class OnboardingFormState {
     this.relationshipType = '',
     this.displayName = '',
     this.birthYear,
+    this.birthMonth,
+    this.birthDay,
     this.gender,
     this.nationality,
     this.residingCountry,
@@ -54,11 +58,15 @@ class OnboardingFormState {
     String? relationshipType,
     String? displayName,
     int? birthYear,
+    int? birthMonth,
+    int? birthDay,
     String? gender,
     String? nationality,
     String? residingCountry,
     String? nativeLanguage,
     String? learningLanguage,
+    bool clearNativeLanguage = false,
+    bool clearLearningLanguage = false,
     String? bio,
     String? occupation,
     List<String>? keywords,
@@ -73,11 +81,16 @@ class OnboardingFormState {
       relationshipType: relationshipType ?? this.relationshipType,
       displayName: displayName ?? this.displayName,
       birthYear: birthYear ?? this.birthYear,
+      birthMonth: birthMonth ?? this.birthMonth,
+      birthDay: birthDay ?? this.birthDay,
       gender: gender ?? this.gender,
       nationality: nationality ?? this.nationality,
       residingCountry: residingCountry ?? this.residingCountry,
-      nativeLanguage: nativeLanguage ?? this.nativeLanguage,
-      learningLanguage: learningLanguage ?? this.learningLanguage,
+      nativeLanguage:
+          clearNativeLanguage ? null : nativeLanguage ?? this.nativeLanguage,
+      learningLanguage: clearLearningLanguage
+          ? null
+          : learningLanguage ?? this.learningLanguage,
       bio: bio ?? this.bio,
       occupation: occupation ?? this.occupation,
       keywords: keywords ?? this.keywords,
@@ -99,16 +112,24 @@ class OnboardingFormNotifier extends Notifier<OnboardingFormState> {
       state = state.copyWith(relationshipType: value);
   void setDisplayName(String value) =>
       state = state.copyWith(displayName: value);
-  void setBirthYear(int value) => state = state.copyWith(birthYear: value);
+  void setBirthDate(DateTime value) => state = state.copyWith(
+        birthYear: value.year,
+        birthMonth: value.month,
+        birthDay: value.day,
+      );
   void setGender(String value) => state = state.copyWith(gender: value);
   void setNationality(String value) =>
       state = state.copyWith(nationality: value);
   void setResidingCountry(String value) =>
       state = state.copyWith(residingCountry: value);
-  void setNativeLanguage(String value) =>
-      state = state.copyWith(nativeLanguage: value);
-  void setLearningLanguage(String value) =>
-      state = state.copyWith(learningLanguage: value);
+  void setNativeLanguage(String value) => state = state.copyWith(
+        nativeLanguage: value,
+        clearLearningLanguage: state.learningLanguage == value,
+      );
+  void setLearningLanguage(String value) => state = state.copyWith(
+        learningLanguage: value,
+        clearNativeLanguage: state.nativeLanguage == value,
+      );
   void setBio(String value) => state = state.copyWith(bio: value);
   void setOccupation(String value) => state = state.copyWith(occupation: value);
 

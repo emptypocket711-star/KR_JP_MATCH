@@ -9,6 +9,7 @@ import '../../../core/widgets/bottom_nav_bar.dart';
 import '../../../core/widgets/nationality_badge.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../../core/widgets/user_name_text.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 
 class MatchesScreen extends ConsumerWidget {
   const MatchesScreen({super.key});
@@ -159,10 +160,21 @@ class _MatchCard extends StatelessWidget {
             Stack(
               children: [
                 if (photoUrl.isNotEmpty)
-                  CircleAvatar(
-                    radius: 28,
-                    backgroundColor: AppTheme.surface,
-                    backgroundImage: NetworkImage(photoUrl),
+                  ClipOval(
+                    child: SizedBox.square(
+                      dimension: 56,
+                      child: AuthenticatedStorageImage(
+                        reference: photoUrl,
+                        placeholder: DefaultAvatar(
+                          nationality: nationality,
+                          gender: match.partnerGender(currentUid),
+                        ),
+                        errorWidget: DefaultAvatar(
+                          nationality: nationality,
+                          gender: match.partnerGender(currentUid),
+                        ),
+                      ),
+                    ),
                   )
                 else
                   DefaultAvatarCircle(

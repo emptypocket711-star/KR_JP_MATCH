@@ -56,8 +56,8 @@ class LowKeySheet extends StatelessWidget {
           const SizedBox(height: 8),
           Text(
             context.t(
-              '대화를 시작하려면 열쇠가 필요해요.\n매일 자정에 3개가 무료로 충전돼요.',
-              '会話を始めるには鍵が必要です。\n毎日深夜に3個が無料でチャージされます。',
+              '대화를 시작하려면 열쇠가 필요해요.\n오늘 아직 보상을 받지 않았다면 라운지에 첫 글을 작성하고 열쇠 3개를 받을 수 있어요.',
+              '会話を始めるには鍵が必要です。\n今日まだボーナスを受け取っていない場合、ラウンジへの最初の投稿で鍵を3個受け取れます。',
             ),
             textAlign: TextAlign.center,
             style: const TextStyle(
@@ -83,7 +83,7 @@ class LowKeySheet extends StatelessWidget {
                     padding: const EdgeInsets.symmetric(vertical: 15),
                     child: Center(
                       child: Text(
-                        context.t('열쇠 충전하기', '鍵をチャージする'),
+                        context.t('열쇠 받는 방법 보기', '鍵の入手方法を見る'),
                         style: const TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.w700,

@@ -1,5 +1,3 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import '../../../app/theme/app_theme.dart';
 
@@ -13,13 +11,13 @@ const _ratingTags = [
 ];
 
 class RatingBottomSheet extends StatefulWidget {
-  final String ratedUid;
   final String ratedName;
+  final Future<void> Function(int stars, List<String> tags) onSubmit;
   final VoidCallback? onSubmitted;
 
   const RatingBottomSheet({
-    required this.ratedUid,
     required this.ratedName,
+    required this.onSubmit,
     this.onSubmitted,
     super.key,
   });
@@ -36,20 +34,10 @@ class _RatingBottomSheetState extends State<RatingBottomSheet> {
 
   Future<void> _submit() async {
     if (_stars == 0 || _isSubmitting) return;
-    final currentUser = FirebaseAuth.instance.currentUser;
-    if (currentUser == null) return;
-
     setState(() => _isSubmitting = true);
 
-    final ratingId = '${currentUser.uid}_${widget.ratedUid}';
     try {
-      await FirebaseFirestore.instance.collection('ratings').doc(ratingId).set({
-        'raterUid': currentUser.uid,
-        'ratedUid': widget.ratedUid,
-        'stars': _stars,
-        'tags': _selectedTags.toList(),
-        'createdAt': FieldValue.serverTimestamp(),
-      });
+      await widget.onSubmit(_stars, _selectedTags.toList(growable: false));
       if (mounted) {
         setState(() => _submitted = true);
         widget.onSubmitted?.call();

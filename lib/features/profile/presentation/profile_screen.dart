@@ -1,10 +1,10 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../../../app/theme/app_theme.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 import '../../../core/widgets/bottom_nav_bar.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../../core/widgets/user_name_text.dart';
@@ -63,7 +63,7 @@ class _EmptyProfile extends StatelessWidget {
             height: 80,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: AppTheme.primaryLight.withOpacity(0.3),
+              color: AppTheme.primaryLight.withValues(alpha: 0.3),
             ),
             child: const Icon(Icons.person_outline,
                 size: 40, color: AppTheme.primary),
@@ -191,13 +191,17 @@ class _PhotoHeaderState extends State<_PhotoHeader> {
         PageView.builder(
           itemCount: widget.photoUrls.length,
           onPageChanged: (i) => setState(() => _current = i),
-          itemBuilder: (_, i) => CachedNetworkImage(
-            imageUrl: widget.photoUrls[i],
+          itemBuilder: (_, i) => AuthenticatedStorageImage(
+            reference: widget.photoUrls[i],
             fit: BoxFit.cover,
-            placeholder: (_, __) =>
-                const Center(child: CircularProgressIndicator()),
-            errorWidget: (_, __, ___) =>
-                const Center(child: Icon(Icons.broken_image_outlined)),
+            placeholder: DefaultAvatar(
+              nationality: widget.nationality,
+              gender: widget.gender,
+            ),
+            errorWidget: DefaultAvatar(
+              nationality: widget.nationality,
+              gender: widget.gender,
+            ),
           ),
         ),
         // 하단 그라데이션
@@ -223,7 +227,7 @@ class _PhotoHeaderState extends State<_PhotoHeader> {
                   decoration: BoxDecoration(
                     color: _current == i
                         ? Colors.white
-                        : Colors.white.withOpacity(0.5),
+                        : Colors.white.withValues(alpha: 0.5),
                     borderRadius: BorderRadius.circular(2),
                   ),
                 );
@@ -406,7 +410,9 @@ class _KeywordChip extends StatelessWidget {
           colors: [Color(0xFFFFECF0), Color(0xFFFFEDE6)],
         ),
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppTheme.primaryLight.withOpacity(0.5)),
+        border: Border.all(
+          color: AppTheme.primaryLight.withValues(alpha: 0.5),
+        ),
       ),
       child: Text(label,
           style: const TextStyle(

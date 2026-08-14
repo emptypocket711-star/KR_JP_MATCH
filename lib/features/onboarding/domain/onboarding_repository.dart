@@ -2,6 +2,8 @@ class UserProfileInput {
   final String relationshipType;
   final String displayName;
   final int birthYear;
+  final int birthMonth;
+  final int birthDay;
   final String gender;
   final String nationality;
   final String residingCountry;
@@ -21,6 +23,8 @@ class UserProfileInput {
     required this.relationshipType,
     required this.displayName,
     required this.birthYear,
+    required this.birthMonth,
+    required this.birthDay,
     required this.gender,
     required this.nationality,
     required this.residingCountry,
@@ -42,6 +46,8 @@ class UserProfileInput {
       'relationshipType': relationshipType,
       'displayName': displayName,
       'birthYear': birthYear,
+      'birthMonth': birthMonth,
+      'birthDay': birthDay,
       'gender': gender,
       'nationality': nationality,
       'residingCountry': residingCountry,
@@ -50,7 +56,7 @@ class UserProfileInput {
       'bio': bio,
       'occupation': occupation,
       'keywords': keywords,
-      'qaItems': qaItems,
+      'qaItems': completedQaItems(qaItems),
       'photoUrls': photoUrls,
       'preferredGender': preferredGender,
       'preferredNationality': preferredNationality,
@@ -60,6 +66,24 @@ class UserProfileInput {
   }
 }
 
+List<Map<String, String>> completedQaItems(
+  Iterable<Map<String, String>> items,
+) {
+  return [
+    for (final item in items)
+      if ((item['question'] ?? '').trim().isNotEmpty &&
+          (item['answer'] ?? '').trim().isNotEmpty)
+        {
+          'question': item['question']!.trim(),
+          'answer': item['answer']!.trim(),
+        },
+  ];
+}
+
 abstract class OnboardingRepository {
   Future<void> completeOnboarding(UserProfileInput input);
+
+  Future<List<String>> uploadProfilePhotos(List<String> localPaths);
+
+  Future<void> deleteProfilePhoto(String reference);
 }

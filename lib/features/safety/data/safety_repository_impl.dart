@@ -1,11 +1,15 @@
 import 'package:cloud_functions/cloud_functions.dart';
+import '../../../app/config/app_config.dart';
 import '../domain/safety_repository.dart';
 
 class SafetyRepositoryImpl implements SafetyRepository {
   final FirebaseFunctions _functions;
 
   SafetyRepositoryImpl({FirebaseFunctions? functions})
-      : _functions = functions ?? FirebaseFunctions.instance;
+      : _functions = functions ??
+            FirebaseFunctions.instanceFor(
+              region: AppConfig.firebaseFunctionsRegion,
+            );
 
   @override
   Future<void> blockUser(String targetUid, {String? reason}) async {

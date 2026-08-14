@@ -1,6 +1,7 @@
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import '../domain/auth_repository.dart';
+import '../../../core/services/fcm_service.dart';
 import '../../../core/services/firebase_service.dart';
 
 class AuthRepositoryImpl implements AuthRepository {
@@ -36,6 +37,7 @@ class AuthRepositoryImpl implements AuthRepository {
 
   @override
   Future<void> signOut() async {
+    await FcmService().detachForSignOut();
     await _firebaseService.auth.signOut();
     await _googleSignIn.signOut();
   }

@@ -1,5 +1,4 @@
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -11,6 +10,7 @@ import '../../../core/widgets/nationality_badge.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../../core/widgets/user_name_text.dart';
 import '../../../core/i18n/ui_text.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 
 class LoungeScreen extends ConsumerWidget {
   const LoungeScreen({super.key});
@@ -152,6 +152,28 @@ class _PostList extends StatelessWidget {
       return const Center(child: CircularProgressIndicator());
     }
 
+    if (state.error != null && state.posts.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              context.t(
+                '라운지 글을 불러오지 못했어요.',
+                'ラウンジの投稿を読み込めませんでした。',
+              ),
+              style: const TextStyle(color: AppTheme.textSecondary),
+            ),
+            const SizedBox(height: 12),
+            OutlinedButton(
+              onPressed: notifier.refresh,
+              child: Text(context.t('다시 시도', '再試行')),
+            ),
+          ],
+        ),
+      );
+    }
+
     final posts = state.filteredPosts;
 
     if (posts.isEmpty) {
@@ -186,19 +208,8 @@ class _PostList extends StatelessWidget {
           post: posts[i],
           myNationality: state.myNationality,
           onLike: () => notifier.toggleLike(posts[i].id),
-          onOpen: () {
-            if (posts[i].id.startsWith('mock_')) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    context.t('샘플 글은 열 수 없습니다.', 'サンプル投稿は開けません。'),
-                  ),
-                ),
-              );
-              return;
-            }
-            context.push('/lounge/post/${posts[i].id}');
-          },
+          onOpen: () => context.push('/lounge/post/${posts[i].id}'),
+          translate: notifier.translate,
         ),
       ),
     );
@@ -211,12 +222,14 @@ class _PostCard extends StatefulWidget {
   final String myNationality;
   final VoidCallback onLike;
   final VoidCallback onOpen;
+  final Future<String> Function(String text) translate;
 
   const _PostCard({
     required this.post,
     required this.myNationality,
     required this.onLike,
     required this.onOpen,
+    required this.translate,
   });
 
   @override
@@ -238,12 +251,7 @@ class _PostCardState extends State<_PostCard> {
     }
     setState(() => _isTranslating = true);
     try {
-      final result =
-          await FirebaseFunctions.instance.httpsCallable('translateText').call({
-        'text': post.content,
-        'targetLang': widget.myNationality == 'KR' ? 'ko' : 'ja',
-      });
-      final translated = (result.data as Map)['translatedText'] as String?;
+      final translated = await widget.translate(post.content);
       if (mounted) {
         setState(() {
           _localTranslation = translated;
@@ -311,10 +319,21 @@ class _PostCardState extends State<_PostCard> {
                         onTap: () =>
                             context.push('/profile/detail/${post.uid}'),
                         child: post.authorPhotoUrl.isNotEmpty
-                            ? CircleAvatar(
-                                radius: 20,
-                                backgroundImage:
-                                    NetworkImage(post.authorPhotoUrl),
+                            ? ClipOval(
+                                child: SizedBox.square(
+                                  dimension: 40,
+                                  child: AuthenticatedStorageImage(
+                                    reference: post.authorPhotoUrl,
+                                    placeholder: DefaultAvatar(
+                                      nationality: post.authorNationality,
+                                      gender: post.authorGender,
+                                    ),
+                                    errorWidget: DefaultAvatar(
+                                      nationality: post.authorNationality,
+                                      gender: post.authorGender,
+                                    ),
+                                  ),
+                                ),
                               )
                             : DefaultAvatarCircle(
                                 nationality: post.authorNationality,

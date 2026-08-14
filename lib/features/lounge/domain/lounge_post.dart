@@ -1,5 +1,3 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
-
 class LoungePost {
   static const allCategory = '\uC804\uCCB4';
 
@@ -39,25 +37,24 @@ class LoungePost {
     this.originalLang,
   });
 
-  factory LoungePost.fromDoc(DocumentSnapshot doc) {
-    final raw = doc.data();
-    final d = raw is Map<String, dynamic> ? raw : <String, dynamic>{};
+  factory LoungePost.fromMap(Map<String, dynamic> data) {
     return LoungePost(
-      id: doc.id,
-      uid: d['uid'] as String? ?? '',
-      authorName: d['authorName'] as String? ?? 'User',
-      authorPhotoUrl: d['authorPhotoUrl'] as String? ?? '',
-      authorNationality: d['authorNationality'] as String? ?? 'KR',
-      authorGender: d['authorGender'] as String? ?? 'female',
-      category: d['category'] as String? ?? '\uC77C\uC0C1',
-      content: d['content'] as String? ?? '',
-      imageUrls: List<String>.from(d['imageUrls'] as List? ?? const []),
-      likeCount: (d['likeCount'] as num?)?.toInt() ?? 0,
-      commentCount: (d['commentCount'] as num?)?.toInt() ?? 0,
-      createdAt: (d['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
-      translatedKo: d['translatedKo'] as String?,
-      translatedJa: d['translatedJa'] as String?,
-      originalLang: d['originalLang'] as String?,
+      id: data['id'] as String? ?? '',
+      uid: data['uid'] as String? ?? '',
+      authorName: data['authorName'] as String? ?? 'User',
+      authorPhotoUrl: data['authorPhotoUrl'] as String? ?? '',
+      authorNationality: data['authorNationality'] as String? ?? 'KR',
+      authorGender: data['authorGender'] as String? ?? 'female',
+      category: data['category'] as String? ?? '\uC77C\uC0C1',
+      content: data['content'] as String? ?? '',
+      imageUrls: List<String>.from(data['imageUrls'] as List? ?? const []),
+      likeCount: (data['likeCount'] as num?)?.toInt() ?? 0,
+      commentCount: (data['commentCount'] as num?)?.toInt() ?? 0,
+      createdAt: loungeDateTimeFromCallable(data['createdAt']),
+      isLikedByMe: data['isLikedByMe'] as bool? ?? false,
+      translatedKo: data['translatedKo'] as String?,
+      translatedJa: data['translatedJa'] as String?,
+      originalLang: data['originalLang'] as String?,
     );
   }
 
@@ -94,6 +91,34 @@ class LoungePost {
     // originalLang 없는 구글 글은 nationality 기반 폴백
     return authorNationality != myNationality;
   }
+}
+
+DateTime loungeDateTimeFromCallable(Object? value) {
+  if (value is DateTime) return value;
+  if (value is String) {
+    return DateTime.tryParse(value)?.toLocal() ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+  }
+  if (value is num) {
+    return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+  }
+  if (value is Map) {
+    final seconds = value['_seconds'] ?? value['seconds'];
+    final nanoseconds = value['_nanoseconds'] ?? value['nanoseconds'] ?? 0;
+    if (seconds is num && nanoseconds is num) {
+      return DateTime.fromMicrosecondsSinceEpoch(
+        seconds.toInt() * Duration.microsecondsPerSecond +
+            nanoseconds.toInt() ~/ 1000,
+      );
+    }
+  }
+  try {
+    final date = (value as dynamic).toDate();
+    if (date is DateTime) return date;
+  } catch (_) {
+    // Unknown callable timestamp encodings remain safely parseable as epoch.
+  }
+  return DateTime.fromMillisecondsSinceEpoch(0);
 }
 
 const loungeCategories = [

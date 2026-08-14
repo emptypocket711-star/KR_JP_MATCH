@@ -8,7 +8,7 @@ final matchesRepositoryProvider = Provider<MatchesRepository>((ref) {
   return MatchesRepositoryImpl();
 });
 
-final matchesStreamProvider = StreamProvider<List<Match>>((ref) {
+final matchesStreamProvider = StreamProvider.autoDispose<List<Match>>((ref) {
   final currentUser = FirebaseAuth.instance.currentUser;
   if (currentUser == null) {
     return Stream.value([]);

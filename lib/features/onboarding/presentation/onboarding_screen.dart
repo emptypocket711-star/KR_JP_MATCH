@@ -1,9 +1,8 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_storage/firebase_storage.dart';
+import '../../../core/media/authenticated_storage_image.dart';
+import '../../../core/media/image_cropper_service.dart';
 import '../domain/onboarding_repository.dart';
 import 'onboarding_provider.dart';
 import '../../auth/presentation/auth_provider.dart';
@@ -46,8 +45,8 @@ const _allKeywords = [
 const _relationshipTypes = [
   ('친구', '새로운 친구를 사귀고 싶어요', Icons.people),
   ('언어교환', '언어를 함께 배우고 싶어요', Icons.translate),
-  ('연애', '진지한 연애를 원해요', Icons.favorite),
-  ('결혼', '결혼을 전제로 만나고 싶어요', Icons.diamond),
+  ('문화교류', '서로의 일상과 문화를 알고 싶어요', Icons.forum_outlined),
+  ('친한친구', '천천히 오래 이야기할 친구를 찾고 있어요', Icons.favorite_border),
 ];
 
 class OnboardingScreen extends ConsumerStatefulWidget {
@@ -85,20 +84,17 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   }
 
   Future<void> _uploadPhotos(List<String> localPaths) async {
-    final storage = FirebaseStorage.instance;
-    final userId = FirebaseAuth.instance.currentUser?.uid;
-    if (userId == null) throw Exception('Not authenticated');
-
-    final existingCount =
-        ref.read(onboardingFormStateProvider).photoUrls.length;
-    for (int i = 0; i < localPaths.length; i++) {
-      final file = File(localPaths[i]);
-      final storageRef =
-          storage.ref('users/$userId/photo_${existingCount + i}.jpg');
-      await storageRef.putFile(file);
-      final url = await storageRef.getDownloadURL();
-      ref.read(onboardingFormStateProvider.notifier).addPhotoUrl(url);
+    final canonicalPaths = await ref
+        .read(onboardingRepositoryProvider)
+        .uploadProfilePhotos(localPaths);
+    for (final path in canonicalPaths) {
+      ref.read(onboardingFormStateProvider.notifier).addPhotoUrl(path);
     }
+  }
+
+  Future<void> _removePhoto(String reference) async {
+    await ref.read(onboardingRepositoryProvider).deleteProfilePhoto(reference);
+    ref.read(onboardingFormStateProvider.notifier).removePhotoUrl(reference);
   }
 
   Future<void> _submitOnboarding() async {
@@ -107,12 +103,14 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
     if (formState.relationshipType.isEmpty ||
         formState.displayName.isEmpty ||
         formState.birthYear == null ||
+        formState.birthMonth == null ||
+        formState.birthDay == null ||
         formState.gender == null ||
         formState.nationality == null ||
         formState.residingCountry == null ||
         formState.nativeLanguage == null ||
         formState.learningLanguage == null ||
-        formState.bio.isEmpty) {
+        formState.nativeLanguage == formState.learningLanguage) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('모든 항목을 입력해주세요.')),
       );
@@ -127,6 +125,8 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         relationshipType: formState.relationshipType,
         displayName: formState.displayName,
         birthYear: formState.birthYear!,
+        birthMonth: formState.birthMonth!,
+        birthDay: formState.birthDay!,
         gender: formState.gender!,
         nationality: formState.nationality!,
         residingCountry: formState.residingCountry!,
@@ -144,10 +144,10 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       );
 
       await repository.completeOnboarding(input);
-      // profileExistsProvider 캐시를 무효화 → GoRouter가 재평가해서 /discovery로 이동
+      // profileAccessProvider 캐시를 무효화 → GoRouter가 재평가해서 /discovery로 이동
       // 직접 context.go('/discovery') 하지 않는 이유:
-      // 캐시된 false 값으로 redirect → /onboarding 복귀 문제 방지
-      if (mounted) ref.invalidate(profileExistsProvider);
+      // 캐시된 incomplete 값으로 redirect → /onboarding 복귀 문제 방지
+      if (mounted) ref.invalidate(profileAccessProvider);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
@@ -204,8 +204,10 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
                 ),
                 _BirthYearAndGenderPage(
                   birthYear: formState.birthYear,
+                  birthMonth: formState.birthMonth,
+                  birthDay: formState.birthDay,
                   gender: formState.gender,
-                  onBirthYearChanged: formNotifier.setBirthYear,
+                  onBirthDateChanged: formNotifier.setBirthDate,
                   onGenderChanged: formNotifier.setGender,
                   onNext: _nextPage,
                 ),
@@ -243,6 +245,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
                 _PhotoPage(
                   photoUrls: formState.photoUrls,
                   onPhotosSelected: _uploadPhotos,
+                  onPhotoRemoved: _removePhoto,
                   onNext: _nextPage,
                 ),
                 _PreferencesPage(
@@ -311,7 +314,9 @@ class _RelationshipTypePage extends StatelessWidget {
                             horizontal: 20, vertical: 18),
                         decoration: BoxDecoration(
                           color: isSelected
-                              ? Theme.of(context).primaryColor.withOpacity(0.1)
+                              ? Theme.of(context)
+                                  .primaryColor
+                                  .withValues(alpha: 0.1)
                               : Colors.grey[100],
                           borderRadius: BorderRadius.circular(16),
                           border: Border.all(
@@ -462,22 +467,30 @@ class _DisplayNamePage extends StatelessWidget {
 // ── 생년 / 성별 ─────────────────────────────────────────
 class _BirthYearAndGenderPage extends StatelessWidget {
   final int? birthYear;
+  final int? birthMonth;
+  final int? birthDay;
   final String? gender;
-  final Function(int) onBirthYearChanged;
+  final ValueChanged<DateTime> onBirthDateChanged;
   final Function(String) onGenderChanged;
   final VoidCallback onNext;
 
   const _BirthYearAndGenderPage({
     required this.birthYear,
+    required this.birthMonth,
+    required this.birthDay,
     required this.gender,
-    required this.onBirthYearChanged,
+    required this.onBirthDateChanged,
     required this.onGenderChanged,
     required this.onNext,
   });
 
   @override
   Widget build(BuildContext context) {
-    final canProceed = birthYear != null && gender != null;
+    final selectedBirthDate =
+        birthYear != null && birthMonth != null && birthDay != null
+            ? DateTime(birthYear!, birthMonth!, birthDay!)
+            : null;
+    final canProceed = selectedBirthDate != null && gender != null;
     return Column(
       children: [
         Expanded(
@@ -493,23 +506,43 @@ class _BirthYearAndGenderPage extends StatelessWidget {
                         .headlineSmall
                         ?.copyWith(fontWeight: FontWeight.bold)),
                 const SizedBox(height: 32),
-                Text('출생연도', style: Theme.of(context).textTheme.titleMedium),
+                Text('생년월일', style: Theme.of(context).textTheme.titleMedium),
                 const SizedBox(height: 8),
-                Center(
-                  child: Text('${birthYear ?? 1995}년생',
-                      style: Theme.of(context)
-                          .textTheme
-                          .headlineMedium
-                          ?.copyWith(
-                              fontWeight: FontWeight.bold,
-                              color: Theme.of(context).primaryColor)),
-                ),
-                Slider(
-                  value: (birthYear ?? 1995).toDouble(),
-                  min: 1950,
-                  max: 2007,
-                  divisions: 57,
-                  onChanged: (v) => onBirthYearChanged(v.toInt()),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.calendar_month_outlined),
+                    label: Text(
+                      selectedBirthDate == null
+                          ? '생년월일을 선택해주세요'
+                          : '${selectedBirthDate.year}.'
+                              '${selectedBirthDate.month.toString().padLeft(2, '0')}.'
+                              '${selectedBirthDate.day.toString().padLeft(2, '0')}',
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                    ),
+                    onPressed: () async {
+                      final now = DateTime.now();
+                      final adultYear = now.year - 18;
+                      final latestDay = now.day.clamp(
+                        1,
+                        DateUtils.getDaysInMonth(adultYear, now.month),
+                      );
+                      final latestAdultBirthDate = DateTime(
+                        adultYear,
+                        now.month,
+                        latestDay,
+                      );
+                      final picked = await showDatePicker(
+                        context: context,
+                        initialDate: selectedBirthDate ?? DateTime(1995, 1, 1),
+                        firstDate: DateTime(1950, 1, 1),
+                        lastDate: latestAdultBirthDate,
+                      );
+                      if (picked != null) onBirthDateChanged(picked);
+                    },
+                  ),
                 ),
                 const SizedBox(height: 32),
                 Text('성별', style: Theme.of(context).textTheme.titleMedium),
@@ -581,7 +614,7 @@ class _GenderCard extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 24),
         decoration: BoxDecoration(
           color: selected
-              ? Theme.of(context).primaryColor.withOpacity(0.1)
+              ? Theme.of(context).primaryColor.withValues(alpha: 0.1)
               : Colors.grey[100],
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
@@ -737,7 +770,7 @@ class _FlagCard extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 24),
         decoration: BoxDecoration(
           color: selected
-              ? Theme.of(context).primaryColor.withOpacity(0.1)
+              ? Theme.of(context).primaryColor.withValues(alpha: 0.1)
               : Colors.grey[100],
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
@@ -781,7 +814,9 @@ class _LanguagePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final canProceed = nativeLanguage != null && learningLanguage != null;
+    final canProceed = nativeLanguage != null &&
+        learningLanguage != null &&
+        nativeLanguage != learningLanguage;
     return Column(
       children: [
         Expanded(
@@ -1081,11 +1116,13 @@ class _KeywordsPage extends StatelessWidget {
 class _PhotoPage extends StatefulWidget {
   final List<String> photoUrls;
   final Function(List<String>) onPhotosSelected;
+  final Future<void> Function(String) onPhotoRemoved;
   final VoidCallback onNext;
 
   const _PhotoPage({
     required this.photoUrls,
     required this.onPhotosSelected,
+    required this.onPhotoRemoved,
     required this.onNext,
   });
 
@@ -1100,14 +1137,41 @@ class _PhotoPageState extends State<_PhotoPage> {
   Future<void> _pickImage() async {
     if (widget.photoUrls.length >= 6) return;
     final image = await _picker.pickImage(source: ImageSource.gallery);
-    if (image == null) return;
+    if (image == null || !mounted) return;
+    final sanitizedPath = await cropImageForUpload(
+      context,
+      sourcePath: image.path,
+      preferSquare: true,
+    );
+    if (sanitizedPath == null) return;
+    if (!mounted) {
+      await deleteSanitizedUploadTempFile(sanitizedPath);
+      return;
+    }
     setState(() => _uploading = true);
     try {
-      await widget.onPhotosSelected([image.path]);
+      await widget.onPhotosSelected([sanitizedPath]);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('사진 업로드 실패: $e')));
+      }
+    } finally {
+      await deleteSanitizedUploadTempFile(sanitizedPath);
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
+
+  Future<void> _removeImage(String reference) async {
+    if (_uploading) return;
+    setState(() => _uploading = true);
+    try {
+      await widget.onPhotoRemoved(reference);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('사진 삭제 실패: $error')),
+        );
       }
     } finally {
       if (mounted) setState(() => _uploading = false);
@@ -1154,11 +1218,11 @@ class _PhotoPageState extends State<_PhotoPage> {
                       ...widget.photoUrls.asMap().entries.map((e) {
                         return Stack(
                           children: [
-                            Container(
-                              decoration: BoxDecoration(
+                            Positioned.fill(
+                              child: ClipRRect(
                                 borderRadius: BorderRadius.circular(12),
-                                image: DecorationImage(
-                                  image: NetworkImage(e.value),
+                                child: AuthenticatedStorageImage(
+                                  reference: e.value,
                                   fit: BoxFit.cover,
                                 ),
                               ),
@@ -1179,6 +1243,29 @@ class _PhotoPageState extends State<_PhotoPage> {
                                           color: Colors.white, fontSize: 10)),
                                 ),
                               ),
+                            Positioned(
+                              top: 0,
+                              right: 0,
+                              child: Semantics(
+                                button: true,
+                                label: '사진 제거',
+                                child: SizedBox.square(
+                                  dimension: 48,
+                                  child: IconButton(
+                                    tooltip: '사진 제거',
+                                    onPressed: () => _removeImage(e.value),
+                                    icon: const Icon(
+                                      Icons.close,
+                                      color: Colors.white,
+                                      size: 18,
+                                    ),
+                                    style: IconButton.styleFrom(
+                                      backgroundColor: Colors.black54,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
                           ],
                         );
                       }),
@@ -1193,7 +1280,7 @@ class _PhotoPageState extends State<_PhotoPage> {
                                   width: 2),
                               color: Theme.of(context)
                                   .primaryColor
-                                  .withOpacity(0.05),
+                                  .withValues(alpha: 0.05),
                             ),
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,

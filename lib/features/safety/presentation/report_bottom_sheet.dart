@@ -87,11 +87,21 @@ class _ReportBottomSheetState extends ConsumerState<ReportBottomSheet> {
               style: Theme.of(context).textTheme.headlineSmall,
             ),
             const SizedBox(height: 16),
-            _buildReasonTile('spam', '스팸'),
-            _buildReasonTile('harassment', '괴롭힘'),
-            _buildReasonTile('inappropriate_photo', '부적절한 사진'),
-            _buildReasonTile('fake_profile', '가짜 프로필'),
-            _buildReasonTile('other', '기타'),
+            RadioGroup<String>(
+              groupValue: _selectedReason,
+              onChanged: (newValue) {
+                setState(() => _selectedReason = newValue);
+              },
+              child: Column(
+                children: [
+                  _buildReasonTile('spam', '스팸'),
+                  _buildReasonTile('harassment', '괴롭힘'),
+                  _buildReasonTile('inappropriate_photo', '부적절한 사진'),
+                  _buildReasonTile('fake_profile', '가짜 프로필'),
+                  _buildReasonTile('other', '기타'),
+                ],
+              ),
+            ),
             const SizedBox(height: 24),
             Text('추가 설명 (선택)', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
@@ -130,13 +140,7 @@ class _ReportBottomSheetState extends ConsumerState<ReportBottomSheet> {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       title: Text(label),
-      leading: Radio<String>(
-        value: value,
-        groupValue: _selectedReason,
-        onChanged: (newValue) {
-          setState(() => _selectedReason = newValue);
-        },
-      ),
+      leading: Radio<String>(value: value),
     );
   }
 }

@@ -1,27 +1,34 @@
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import '../domain/lounge_comment.dart';
 import '../domain/lounge_post.dart';
+import '../domain/lounge_repository.dart';
+import 'lounge_provider.dart';
 import '../../../app/theme/app_theme.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../../core/widgets/nationality_badge.dart';
 import '../../../core/widgets/user_name_text.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 
-class LoungeDetailScreen extends StatefulWidget {
+class LoungeDetailScreen extends ConsumerStatefulWidget {
   final String postId;
 
   const LoungeDetailScreen({required this.postId, super.key});
 
   @override
-  State<LoungeDetailScreen> createState() => _LoungeDetailScreenState();
+  ConsumerState<LoungeDetailScreen> createState() => _LoungeDetailScreenState();
 }
 
-class _LoungeDetailScreenState extends State<LoungeDetailScreen> {
+class _LoungeDetailScreenState extends ConsumerState<LoungeDetailScreen> {
   final _commentController = TextEditingController();
   bool _submitting = false;
+  bool _loading = true;
+  bool _likingPost = false;
+  String? _loadError;
+  LoungePost? _post;
+  List<LoungeComment> _comments = const [];
   String _myNationality = 'KR';
   String? _replyingToCommentId;
   String? _replyingToName;
@@ -29,13 +36,31 @@ class _LoungeDetailScreenState extends State<LoungeDetailScreen> {
   @override
   void initState() {
     super.initState();
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid != null) {
-      FirebaseFirestore.instance.collection('users').doc(uid).get().then((doc) {
-        if (mounted) {
-          setState(() =>
-              _myNationality = (doc.data()?['nationality'] as String?) ?? 'KR');
-        }
+    Future.microtask(_loadThread);
+  }
+
+  Future<void> _loadThread({bool showLoader = true}) async {
+    if (showLoader && mounted) setState(() => _loading = true);
+    try {
+      final repository = ref.read(loungeRepositoryProvider);
+      final values = await Future.wait<Object>([
+        repository.getPost(widget.postId),
+        repository.listComments(widget.postId),
+      ]);
+      if (!mounted) return;
+      final postResult = values[0] as LoungePostResult;
+      setState(() {
+        _post = postResult.post;
+        _myNationality = postResult.myNationality;
+        _comments = values[1] as List<LoungeComment>;
+        _loadError = null;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loadError = error.toString();
+        _loading = false;
       });
     }
   }
@@ -54,16 +79,16 @@ class _LoungeDetailScreenState extends State<LoungeDetailScreen> {
     try {
       final replyCommentId = _replyingToCommentId;
       if (replyCommentId == null) {
-        await FirebaseFunctions.instance.httpsCallable('addPostComment').call({
-          'postId': widget.postId,
-          'content': text,
-        });
+        await ref.read(loungeRepositoryProvider).addComment(
+              postId: widget.postId,
+              content: text,
+            );
       } else {
-        await FirebaseFunctions.instance.httpsCallable('addPostReply').call({
-          'postId': widget.postId,
-          'commentId': replyCommentId,
-          'content': text,
-        });
+        await ref.read(loungeRepositoryProvider).addReply(
+              postId: widget.postId,
+              commentId: replyCommentId,
+              content: text,
+            );
       }
 
       _commentController.clear();
@@ -71,6 +96,7 @@ class _LoungeDetailScreenState extends State<LoungeDetailScreen> {
         _replyingToCommentId = null;
         _replyingToName = null;
       });
+      await _loadThread(showLoader: false);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -82,115 +108,135 @@ class _LoungeDetailScreenState extends State<LoungeDetailScreen> {
     }
   }
 
-  Future<void> _togglePostLike(LoungePost post, bool isLiked) async {
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return;
-
-    final likeRef = FirebaseFirestore.instance
-        .collection('post_likes')
-        .doc(post.id)
-        .collection('likes')
-        .doc(uid);
-    final postRef = FirebaseFirestore.instance.collection('posts').doc(post.id);
-
+  Future<void> _togglePostLike() async {
+    final post = _post;
+    if (post == null || _likingPost) return;
+    setState(() => _likingPost = true);
     try {
-      final batch = FirebaseFirestore.instance.batch();
-      if (isLiked) {
-        batch.delete(likeRef);
-        batch.update(postRef, {'likeCount': FieldValue.increment(-1)});
-      } else {
-        batch.set(likeRef, {
-          'uid': uid,
-          'createdAt': FieldValue.serverTimestamp(),
-        });
-        batch.update(postRef, {'likeCount': FieldValue.increment(1)});
-      }
-      await batch.commit();
-    } catch (e) {
+      final result =
+          await ref.read(loungeRepositoryProvider).toggleLike(post.id);
+      if (!mounted) return;
+      setState(() {
+        _post = post.copyWith(
+          isLikedByMe: result.liked,
+          likeCount: result.likeCount,
+        );
+      });
+    } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('좋아요 처리 실패: $e')),
+          SnackBar(content: Text('좋아요 처리 실패: $error')),
         );
       }
+    } finally {
+      if (mounted) setState(() => _likingPost = false);
     }
+  }
+
+  Future<String> _translate(String text) {
+    return ref.read(loungeRepositoryProvider).translate(
+          text: text,
+          targetLang: _myNationality == 'KR' ? 'ko' : 'ja',
+        );
   }
 
   @override
   Widget build(BuildContext context) {
-    final postRef =
-        FirebaseFirestore.instance.collection('posts').doc(widget.postId);
-
     return Scaffold(
       backgroundColor: AppTheme.background,
       appBar: AppBar(
         backgroundColor: AppTheme.background,
         title: const Text('라운지'),
       ),
-      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: postRef.snapshots(),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (!snapshot.hasData || !snapshot.data!.exists) {
-            return const Center(child: Text('글을 찾을 수 없습니다.'));
-          }
-
-          final post = LoungePost.fromDoc(snapshot.data!);
-          return Column(
-            children: [
-              Expanded(
-                child: CustomScrollView(
-                  slivers: [
-                    SliverToBoxAdapter(
-                      child: _ThreadPost(
-                        post: post,
-                        myNationality: _myNationality,
-                        onLikeChanged: (isLiked) =>
-                            _togglePostLike(post, isLiked),
-                      ),
-                    ),
-                    const SliverToBoxAdapter(
-                      child: Padding(
-                        padding: EdgeInsets.fromLTRB(20, 18, 20, 8),
-                        child: Text(
-                          '댓글',
-                          style: TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w800,
-                            color: AppTheme.textPrimary,
+      body: _loading && _post == null
+          ? const Center(child: CircularProgressIndicator())
+          : _post == null
+              ? _LoungeLoadError(
+                  message: _loadError,
+                  onRetry: _loadThread,
+                )
+              : Column(
+                  children: [
+                    Expanded(
+                      child: CustomScrollView(
+                        slivers: [
+                          SliverToBoxAdapter(
+                            child: _ThreadPost(
+                              post: _post!,
+                              myNationality: _myNationality,
+                              onLikeChanged: _togglePostLike,
+                              translate: _translate,
+                            ),
                           ),
-                        ),
+                          const SliverToBoxAdapter(
+                            child: Padding(
+                              padding: EdgeInsets.fromLTRB(20, 18, 20, 8),
+                              child: Text(
+                                '댓글',
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w800,
+                                  color: AppTheme.textPrimary,
+                                ),
+                              ),
+                            ),
+                          ),
+                          _CommentsList(
+                            comments: _comments,
+                            myNationality: _myNationality,
+                            translate: _translate,
+                            onReply: (commentId, authorName) {
+                              setState(() {
+                                _replyingToCommentId = commentId;
+                                _replyingToName = authorName;
+                              });
+                            },
+                          ),
+                        ],
                       ),
                     ),
-                    _CommentsList(
-                      postId: widget.postId,
-                      myNationality: _myNationality,
-                      onReply: (commentId, authorName) {
+                    _CommentInput(
+                      controller: _commentController,
+                      submitting: _submitting,
+                      replyingToName: _replyingToName,
+                      onCancelReply: () {
                         setState(() {
-                          _replyingToCommentId = commentId;
-                          _replyingToName = authorName;
+                          _replyingToCommentId = null;
+                          _replyingToName = null;
                         });
                       },
+                      onSubmit: _submitComment,
                     ),
                   ],
                 ),
-              ),
-              _CommentInput(
-                controller: _commentController,
-                submitting: _submitting,
-                replyingToName: _replyingToName,
-                onCancelReply: () {
-                  setState(() {
-                    _replyingToCommentId = null;
-                    _replyingToName = null;
-                  });
-                },
-                onSubmit: _submitComment,
-              ),
-            ],
-          );
-        },
+    );
+  }
+}
+
+class _LoungeLoadError extends StatelessWidget {
+  const _LoungeLoadError({required this.message, required this.onRetry});
+
+  final String? message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text('글을 찾을 수 없습니다.'),
+          if (message != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              message!,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppTheme.textSecondary),
+            ),
+          ],
+          const SizedBox(height: 12),
+          OutlinedButton(onPressed: onRetry, child: const Text('다시 시도')),
+        ],
       ),
     );
   }
@@ -199,12 +245,14 @@ class _LoungeDetailScreenState extends State<LoungeDetailScreen> {
 class _ThreadPost extends StatefulWidget {
   final LoungePost post;
   final String myNationality;
-  final void Function(bool isLiked) onLikeChanged;
+  final VoidCallback onLikeChanged;
+  final Future<String> Function(String text) translate;
 
   const _ThreadPost({
     required this.post,
     required this.myNationality,
     required this.onLikeChanged,
+    required this.translate,
   });
 
   @override
@@ -226,12 +274,7 @@ class _ThreadPostState extends State<_ThreadPost> {
     }
     setState(() => _isTranslating = true);
     try {
-      final result =
-          await FirebaseFunctions.instance.httpsCallable('translateText').call({
-        'text': post.content,
-        'targetLang': widget.myNationality == 'KR' ? 'ko' : 'ja',
-      });
-      final translated = (result.data as Map)['translatedText'] as String?;
+      final translated = await widget.translate(post.content);
       if (mounted) {
         setState(() {
           _localTranslation = translated;
@@ -385,35 +428,19 @@ class _ThreadPostState extends State<_ThreadPost> {
 
 class _PostLikeButton extends StatelessWidget {
   final LoungePost post;
-  final void Function(bool isLiked) onLikeChanged;
+  final VoidCallback onLikeChanged;
 
   const _PostLikeButton({required this.post, required this.onLikeChanged});
 
   @override
   Widget build(BuildContext context) {
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) {
-      return _PostLikeContent(isLiked: false, likeCount: post.likeCount);
-    }
-
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance
-          .collection('post_likes')
-          .doc(post.id)
-          .collection('likes')
-          .doc(uid)
-          .snapshots(),
-      builder: (context, snapshot) {
-        final isLiked = snapshot.data?.exists ?? false;
-        return GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => onLikeChanged(isLiked),
-          child: _PostLikeContent(
-            isLiked: isLiked,
-            likeCount: post.likeCount,
-          ),
-        );
-      },
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onLikeChanged,
+      child: _PostLikeContent(
+        isLiked: post.isLikedByMe,
+        likeCount: post.likeCount,
+      ),
     );
   }
 }
@@ -451,64 +478,47 @@ class _PostLikeContent extends StatelessWidget {
 }
 
 class _CommentsList extends StatelessWidget {
-  final String postId;
+  final List<LoungeComment> comments;
   final String myNationality;
+  final Future<String> Function(String text) translate;
   final void Function(String commentId, String authorName) onReply;
 
   const _CommentsList({
-    required this.postId,
+    required this.comments,
     required this.myNationality,
+    required this.translate,
     required this.onReply,
   });
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance
-          .collection('posts')
-          .doc(postId)
-          .collection('comments')
-          .orderBy('createdAt')
-          .snapshots(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const SliverToBoxAdapter(
-            child: Center(child: CircularProgressIndicator()),
-          );
-        }
-
-        final comments = snapshot.data?.docs ?? [];
-        if (comments.isEmpty) {
-          return const SliverToBoxAdapter(
-            child: Padding(
-              padding: EdgeInsets.all(24),
-              child: Center(
-                child: Text(
-                  '첫 댓글을 남겨보세요.',
-                  style: TextStyle(color: AppTheme.textSecondary),
-                ),
-              ),
+    if (comments.isEmpty) {
+      return const SliverToBoxAdapter(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Center(
+            child: Text(
+              '첫 댓글을 남겨보세요.',
+              style: TextStyle(color: AppTheme.textSecondary),
             ),
-          );
-        }
-
-        return SliverList.separated(
-          itemCount: comments.length,
-          separatorBuilder: (_, __) => const Divider(
-            height: 1,
-            color: AppTheme.divider,
-            indent: 72,
           ),
-          itemBuilder: (context, index) {
-            final comment = comments[index];
-            return _CommentTile(
-              postId: postId,
-              commentId: comment.id,
-              myNationality: myNationality,
-              data: comment.data(),
-              onReply: onReply,
-            );
-          },
+        ),
+      );
+    }
+
+    return SliverList.separated(
+      itemCount: comments.length,
+      separatorBuilder: (_, __) => const Divider(
+        height: 1,
+        color: AppTheme.divider,
+        indent: 72,
+      ),
+      itemBuilder: (context, index) {
+        return _CommentTile(
+          comment: comments[index],
+          myNationality: myNationality,
+          translate: translate,
+          onReply: onReply,
         );
       },
     );
@@ -516,17 +526,15 @@ class _CommentsList extends StatelessWidget {
 }
 
 class _CommentTile extends StatefulWidget {
-  final String postId;
-  final String commentId;
+  final LoungeComment comment;
   final String myNationality;
-  final Map<String, dynamic> data;
+  final Future<String> Function(String text) translate;
   final void Function(String commentId, String authorName) onReply;
 
   const _CommentTile({
-    required this.postId,
-    required this.commentId,
+    required this.comment,
     required this.myNationality,
-    required this.data,
+    required this.translate,
     required this.onReply,
   });
 
@@ -546,12 +554,7 @@ class _CommentTileState extends State<_CommentTile> {
     }
     setState(() => _isTranslating = true);
     try {
-      final result =
-          await FirebaseFunctions.instance.httpsCallable('translateText').call({
-        'text': widget.data['content'] as String? ?? '',
-        'targetLang': widget.myNationality == 'KR' ? 'ko' : 'ja',
-      });
-      final translated = (result.data as Map)['translatedText'] as String?;
+      final translated = await widget.translate(widget.comment.content);
       if (mounted) {
         setState(() {
           _translatedText = translated;
@@ -566,10 +569,9 @@ class _CommentTileState extends State<_CommentTile> {
 
   @override
   Widget build(BuildContext context) {
-    final createdAt = (widget.data['createdAt'] as Timestamp?)?.toDate();
-    final authorName = widget.data['authorName'] as String? ?? '사용자';
-    final authorNationality =
-        widget.data['authorNationality'] as String? ?? 'KR';
+    final comment = widget.comment;
+    final authorName = comment.authorName;
+    final authorNationality = comment.authorNationality;
     final canTranslate = authorNationality != widget.myNationality;
 
     return Padding(
@@ -578,25 +580,23 @@ class _CommentTileState extends State<_CommentTile> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _AuthorRow(
-            uid: widget.data['uid'] as String? ?? '',
+            uid: comment.uid,
             name: authorName,
-            photoUrl: widget.data['authorPhotoUrl'] as String? ?? '',
+            photoUrl: comment.authorPhotoUrl,
             nationality: authorNationality,
-            gender: widget.data['authorGender'] as String? ?? 'female',
-            trailing: createdAt == null
-                ? null
-                : Text(
-                    _timeAgo(createdAt),
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: AppTheme.textSecondary,
-                    ),
-                  ),
+            gender: comment.authorGender,
+            trailing: Text(
+              _timeAgo(comment.createdAt),
+              style: const TextStyle(
+                fontSize: 11,
+                color: AppTheme.textSecondary,
+              ),
+            ),
           ),
           Padding(
             padding: const EdgeInsets.only(left: 56, top: 4),
             child: Text(
-              widget.data['content'] as String? ?? '',
+              comment.content,
               style: const TextStyle(
                 fontSize: 14,
                 color: AppTheme.textPrimary,
@@ -668,7 +668,7 @@ class _CommentTileState extends State<_CommentTile> {
           Padding(
             padding: const EdgeInsets.only(left: 56, top: 4),
             child: TextButton(
-              onPressed: () => widget.onReply(widget.commentId, authorName),
+              onPressed: () => widget.onReply(comment.id, authorName),
               style: TextButton.styleFrom(
                 padding: EdgeInsets.zero,
                 minimumSize: const Size(48, 28),
@@ -678,9 +678,9 @@ class _CommentTileState extends State<_CommentTile> {
             ),
           ),
           _RepliesList(
-            postId: widget.postId,
-            commentId: widget.commentId,
+            replies: comment.replies,
             myNationality: widget.myNationality,
+            translate: widget.translate,
           ),
         ],
       ),
@@ -689,54 +689,43 @@ class _CommentTileState extends State<_CommentTile> {
 }
 
 class _RepliesList extends StatelessWidget {
-  final String postId;
-  final String commentId;
+  final List<LoungeReply> replies;
   final String myNationality;
+  final Future<String> Function(String text) translate;
 
   const _RepliesList({
-    required this.postId,
-    required this.commentId,
+    required this.replies,
     required this.myNationality,
+    required this.translate,
   });
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance
-          .collection('posts')
-          .doc(postId)
-          .collection('comments')
-          .doc(commentId)
-          .collection('replies')
-          .orderBy('createdAt')
-          .snapshots(),
-      builder: (context, snapshot) {
-        final replies = snapshot.data?.docs ?? [];
-        if (replies.isEmpty) return const SizedBox.shrink();
-
-        return Padding(
-          padding: const EdgeInsets.only(left: 56, top: 4),
-          child: Column(
-            children: replies
-                .map((reply) => _ReplyTile(
-                      data: reply.data(),
-                      myNationality: myNationality,
-                    ))
-                .toList(growable: false),
-          ),
-        );
-      },
+    if (replies.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(left: 56, top: 4),
+      child: Column(
+        children: replies
+            .map((reply) => _ReplyTile(
+                  reply: reply,
+                  myNationality: myNationality,
+                  translate: translate,
+                ))
+            .toList(growable: false),
+      ),
     );
   }
 }
 
 class _ReplyTile extends StatefulWidget {
-  final Map<String, dynamic> data;
+  final LoungeReply reply;
   final String myNationality;
+  final Future<String> Function(String text) translate;
 
   const _ReplyTile({
-    required this.data,
+    required this.reply,
     required this.myNationality,
+    required this.translate,
   });
 
   @override
@@ -755,12 +744,7 @@ class _ReplyTileState extends State<_ReplyTile> {
     }
     setState(() => _isTranslating = true);
     try {
-      final result =
-          await FirebaseFunctions.instance.httpsCallable('translateText').call({
-        'text': widget.data['content'] as String? ?? '',
-        'targetLang': widget.myNationality == 'KR' ? 'ko' : 'ja',
-      });
-      final translated = (result.data as Map)['translatedText'] as String?;
+      final translated = await widget.translate(widget.reply.content);
       if (mounted) {
         setState(() {
           _translatedText = translated;
@@ -775,9 +759,8 @@ class _ReplyTileState extends State<_ReplyTile> {
 
   @override
   Widget build(BuildContext context) {
-    final createdAt = (widget.data['createdAt'] as Timestamp?)?.toDate();
-    final authorNationality =
-        widget.data['authorNationality'] as String? ?? 'KR';
+    final reply = widget.reply;
+    final authorNationality = reply.authorNationality;
     final canTranslate = authorNationality != widget.myNationality;
 
     return Container(
@@ -792,25 +775,23 @@ class _ReplyTileState extends State<_ReplyTile> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _AuthorRow(
-            uid: widget.data['uid'] as String? ?? '',
-            name: widget.data['authorName'] as String? ?? '사용자',
-            photoUrl: widget.data['authorPhotoUrl'] as String? ?? '',
+            uid: reply.uid,
+            name: reply.authorName,
+            photoUrl: reply.authorPhotoUrl,
             nationality: authorNationality,
-            gender: widget.data['authorGender'] as String? ?? 'female',
-            trailing: createdAt == null
-                ? null
-                : Text(
-                    _timeAgo(createdAt),
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: AppTheme.textSecondary,
-                    ),
-                  ),
+            gender: reply.authorGender,
+            trailing: Text(
+              _timeAgo(reply.createdAt),
+              style: const TextStyle(
+                fontSize: 11,
+                color: AppTheme.textSecondary,
+              ),
+            ),
           ),
           Padding(
             padding: const EdgeInsets.only(left: 50, top: 4),
             child: Text(
-              widget.data['content'] as String? ?? '',
+              reply.content,
               style: const TextStyle(
                 fontSize: 14,
                 color: AppTheme.textPrimary,
@@ -910,9 +891,21 @@ class _AuthorRow extends StatelessWidget {
           onTap:
               uid.isEmpty ? null : () => context.push('/profile/detail/$uid'),
           child: photoUrl.isNotEmpty
-              ? CircleAvatar(
-                  radius: 20,
-                  backgroundImage: NetworkImage(photoUrl),
+              ? ClipOval(
+                  child: SizedBox.square(
+                    dimension: 40,
+                    child: AuthenticatedStorageImage(
+                      reference: photoUrl,
+                      placeholder: DefaultAvatar(
+                        nationality: nationality,
+                        gender: gender,
+                      ),
+                      errorWidget: DefaultAvatar(
+                        nationality: nationality,
+                        gender: gender,
+                      ),
+                    ),
+                  ),
                 )
               : DefaultAvatarCircle(
                   nationality: nationality,

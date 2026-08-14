@@ -93,7 +93,6 @@ class _BlockedUserTileState extends State<_BlockedUserTile> {
   @override
   Widget build(BuildContext context) {
     final displayName = widget.data['displayName'] as String? ?? '사용자';
-    final photoUrl = widget.data['photoUrl'] as String? ?? '';
     final nationality = widget.data['nationality'] as String? ?? 'KR';
     final gender = widget.data['gender'] as String? ?? 'female';
 
@@ -108,18 +107,11 @@ class _BlockedUserTileState extends State<_BlockedUserTile> {
         children: [
           Stack(
             children: [
-              if (photoUrl.isNotEmpty)
-                CircleAvatar(
-                  radius: 24,
-                  backgroundImage: NetworkImage(photoUrl),
-                  backgroundColor: AppTheme.surface,
-                )
-              else
-                DefaultAvatarCircle(
-                  nationality: nationality,
-                  gender: gender,
-                  radius: 24,
-                ),
+              DefaultAvatarCircle(
+                nationality: nationality,
+                gender: gender,
+                radius: 24,
+              ),
               Positioned(
                 right: 0,
                 bottom: 0,
