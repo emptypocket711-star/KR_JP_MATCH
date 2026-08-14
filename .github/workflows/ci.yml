@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI: 'true'
+  DART_SUPPRESS_ANALYTICS: 'true'
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flutter:
+    name: Flutter
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: 3.41.9
+          cache: true
+          pub-cache: true
+      - name: Install Flutter dependencies
+        run: flutter pub get --enforce-lockfile
+      - name: Analyze Flutter
+        # The backend-only base still has legacy deprecation infos. Warnings and
+        # errors remain fatal; the stacked client PR removes these infos.
+        run: flutter analyze --no-fatal-infos
+      - name: Test Flutter
+        run: flutter test --no-pub
+
+  functions:
+    name: Functions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: firebase/functions
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: firebase/functions/package-lock.json
+      - name: Install Functions dependencies
+        run: npm ci
+      - name: Lint Functions
+        run: npm run lint
+      - name: Test Functions
+        run: npm test
+      - name: Test deployment contract guards
+        working-directory: .
+        run: |
+          node scripts/test_validate_live_functions_region.js
+          scripts/test_app_check_replay_iam_preflight.sh
+          node scripts/validate_private_media_rollout_contract.js
+
+  firebase-rules:
+    name: Firebase Rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: firebase/test/package-lock.json
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Install Rules test dependencies
+        working-directory: firebase/test
+        run: npm ci
+      - name: Install Firebase CLI
+        run: npm install --global firebase-tools@15.17.0
+      - name: Test Firestore and Storage Rules
+        working-directory: firebase/test
+        run: npm test
