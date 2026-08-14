@@ -19,6 +19,7 @@ function room(overrides = {}) {
     id: 'room_1',
     userIds: ['bob', 'alice'],
     pairKey: 'alice_bob',
+    hiddenFor: [],
     ...overrides,
   };
 }
@@ -103,6 +104,31 @@ test('treats a validated version-one room as healthy and idempotent', () => {
   assert.equal(result.candidates.length, 0);
   assert.equal(result.healthy.length, 1);
   assert.equal(result.healthy[0].directRoomVersion, 1);
+  assert.equal(result.findings.length, 0);
+});
+
+test('never audits or backfills a room with missing, malformed, or non-empty hiddenFor', () => {
+  for (const hiddenFor of [undefined, 'alice', ['alice'], ['bob'], [7]]) {
+    const result = classifyDirectRoomMigration(
+      [room({ hiddenFor })],
+      [pointer()]
+    );
+    assert.equal(result.candidates.length, 0);
+    assert.equal(result.healthy.length, 0);
+    assert.ok(result.findings.some(
+      (finding) => finding.code === 'active-match-hidden-state-invalid'
+    ));
+  }
+});
+
+test('backfills a missing canonical pairKey even when the V1 marker exists', () => {
+  const result = classifyDirectRoomMigration(
+    [room({ directRoomVersion: 1, pairKey: undefined })],
+    [pointer()]
+  );
+
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.healthy.length, 0);
   assert.equal(result.findings.length, 0);
 });
 
@@ -201,6 +227,17 @@ test('requires the chatPairs identity fields and pointer to match exactly', () =
       [room()],
       changedPointer === undefined ? [] : [changedPointer]
     );
+    assert.equal(result.candidates.length, 0);
+    assert.ok(result.findings.length > 0);
+  }
+});
+
+test('rejects active pointers carrying stale closed-room metadata', () => {
+  for (const changedPointer of [
+    pointer({ closedMatchId: 'old_room' }),
+    pointer({ closedReason: 'left_chat' }),
+  ]) {
+    const result = classifyDirectRoomMigration([room()], [changedPointer]);
     assert.equal(result.candidates.length, 0);
     assert.ok(result.findings.length > 0);
   }

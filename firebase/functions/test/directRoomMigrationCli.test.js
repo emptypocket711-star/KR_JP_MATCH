@@ -3,6 +3,7 @@ const { spawnSync } = require('node:child_process');
 const {
   chmodSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } = require('node:fs');
@@ -19,6 +20,10 @@ const {
 } = require('../lib/directRoomMigrationManifest');
 
 const cliPath = path.resolve(__dirname, '../lib/admin/directRoomMigration.js');
+const cliSource = readFileSync(
+  path.resolve(__dirname, '../src/admin/directRoomMigration.ts'),
+  'utf8'
+);
 
 function cliEnvironment(projectId) {
   const env = { ...process.env, GOOGLE_CLOUD_PROJECT: projectId };
@@ -62,6 +67,13 @@ test('CLI documents dry-run default and explicit apply confirmations', () => {
   assert.match(result.stdout, /--confirm-project/);
   assert.match(result.stdout, /--manifest-digest/);
   assert.equal(result.stderr, '');
+});
+
+test('CLI audits and rechecks empty hidden state before marking a V1 room', () => {
+  assert.match(cliSource, /hiddenFor: data\.hiddenFor/);
+  assert.match(cliSource, /!Array\.isArray\(matchData\.hiddenFor\)/);
+  assert.match(cliSource, /matchData\.hiddenFor\.length !== 0/);
+  assert.match(cliSource, /pairKey: params\.candidate\.pairKey/);
 });
 
 test('CLI rejects projects outside the hardcoded Hana allowlist', () => {
@@ -209,6 +221,7 @@ test('CLI requires the separately supplied digest to match a valid manifest', ()
           id: 'room_1',
           userIds: ['alice', 'bob'],
           pairKey: 'alice_bob',
+          hiddenFor: [],
         },
       ],
       [

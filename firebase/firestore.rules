@@ -2,6 +2,68 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    function hasUsableAccount(uid) {
+      let accountPath = /databases/$(database)/documents/users/$(uid);
+      let account = get(accountPath).data;
+      return exists(accountPath)
+        && (!account.keys().hasAny(["isBanned"]) || account.isBanned != true)
+        && (!account.keys().hasAny(["status"])
+          || !(account.status in ["banned", "deleted", "deactivated"]))
+        && (!account.keys().hasAny(["accountStatus"])
+          || !(account.accountStatus in [
+            "banned", "deleting", "deleted", "deactivated"
+          ]))
+        && (!account.keys().hasAny(["isDeleted"]) || account.isDeleted != true)
+        && (!account.keys().hasAny(["deleted"]) || account.deleted != true)
+        && (!account.keys().hasAny(["deletionRequested"])
+          || account.deletionRequested != true)
+        && !account.keys().hasAny(["deletedAt"]);
+    }
+
+    function hasExactDirectRoomParticipants(room) {
+      return room.userIds is list
+        && room.userIds.size() == 2
+        && room.userIds[0] is string
+        && room.userIds[1] is string
+        && room.userIds[0] != room.userIds[1];
+    }
+
+    function hasCurrentDirectRoomPointer(matchId, room) {
+      let pointerPath =
+        /databases/$(database)/documents/chatPairs/$(room.pairKey);
+      let pointer = get(pointerPath).data;
+      return room.pairKey is string
+        && exists(pointerPath)
+        && pointer.pairKey == room.pairKey
+        && pointer.activeMatchId == matchId
+        && pointer.userIds is list
+        && pointer.userIds.size() == 2
+        && room.userIds[0] in pointer.userIds
+        && room.userIds[1] in pointer.userIds
+        && !pointer.keys().hasAny(["closedMatchId", "closedReason"]);
+    }
+
+    function directRoomParticipantsAreUsableAndUnblocked(room) {
+      let firstUid = room.userIds[0];
+      let secondUid = room.userIds[1];
+      return hasUsableAccount(firstUid)
+        && hasUsableAccount(secondUid)
+        && !exists(/databases/$(database)/documents/users/$(firstUid)/blocks/$(secondUid))
+        && !exists(/databases/$(database)/documents/users/$(secondUid)/blocks/$(firstUid));
+    }
+
+    function canReadDirectRoom(matchId, room) {
+      return request.auth != null
+        && hasExactDirectRoomParticipants(room)
+        && request.auth.uid in room.userIds
+        && room.isActive == true
+        && room.directRoomVersion == 1
+        && room.hiddenFor is list
+        && room.hiddenFor.size() == 0
+        && hasCurrentDirectRoomPointer(matchId, room)
+        && directRoomParticipantsAreUsableAndUnblocked(room);
+    }
+
     function isValidOwnUserSettingsUpdate() {
       let changed = request.resource.data.diff(resource.data).affectedKeys();
       let next = request.resource.data;
@@ -84,37 +146,21 @@ service cloud.firestore {
 
     // ===== matches/{matchId} =====
     match /matches/{matchId} {
-      function isExactDirectRoom() {
-        return resource.data.userIds is list
-          && resource.data.userIds.size() == 2
-          && resource.data.userIds[0] is string
-          && resource.data.userIds[1] is string
-          && resource.data.userIds[0] != resource.data.userIds[1];
-      }
-
-      allow get: if request.auth != null
-        && isExactDirectRoom()
-        && request.auth.uid in resource.data.userIds
-        && resource.data.isActive == true
-        && !(request.auth.uid in resource.data.hiddenFor);
-
-      allow list: if request.auth != null
-        && request.auth.uid in resource.data.userIds
-        && resource.data.isActive == true
-        && resource.data.directRoomVersion == 1;
+      allow get: if canReadDirectRoom(matchId, resource.data);
+      // Per-room peer/block/pointer checks are not query-provable in Firestore
+      // Rules. Active lists are returned by the server-owned listActiveChats
+      // callable after the same checks are re-run transactionally.
+      allow list: if false;
 
       // Chat-room creation, point deduction, leaving, favorites, unread updates,
       // and summary updates are server-owned Cloud Function operations.
       allow create, update, delete: if false;
 
       match /messages/{messageId} {
-        allow read: if request.auth != null
-          && get(/databases/$(database)/documents/matches/$(matchId)).data.userIds is list
-          && get(/databases/$(database)/documents/matches/$(matchId)).data.userIds.size() == 2
-          && get(/databases/$(database)/documents/matches/$(matchId)).data.userIds[0] != get(/databases/$(database)/documents/matches/$(matchId)).data.userIds[1]
-          && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.userIds
-          && get(/databases/$(database)/documents/matches/$(matchId)).data.isActive == true
-          && !(request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.hiddenFor);
+        allow read: if canReadDirectRoom(
+          matchId,
+          get(/databases/$(database)/documents/matches/$(matchId)).data
+        );
 
         // Message writes go through the sendMessage callable so the server can
         // enforce active-room, block, ban, and immutable originalText checks.
@@ -133,8 +179,15 @@ service cloud.firestore {
     // server-owned. Participants can only read their own call state.
     match /calls/{callId} {
       allow read: if request.auth != null
+        && resource.data.callerUid is string
+        && resource.data.calleeUid is string
+        && resource.data.callerUid != resource.data.calleeUid
         && (request.auth.uid == resource.data.callerUid
-            || request.auth.uid == resource.data.calleeUid);
+            || request.auth.uid == resource.data.calleeUid)
+        && hasUsableAccount(resource.data.callerUid)
+        && hasUsableAccount(resource.data.calleeUid)
+        && !exists(/databases/$(database)/documents/users/$(resource.data.callerUid)/blocks/$(resource.data.calleeUid))
+        && !exists(/databases/$(database)/documents/users/$(resource.data.calleeUid)/blocks/$(resource.data.callerUid));
       allow create, update, delete: if false;
     }
 

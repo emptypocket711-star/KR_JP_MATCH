@@ -343,6 +343,7 @@ async function auditCurrentState(
         userIds: data.userIds,
         pairKey: data.pairKey,
         directRoomVersion: data.directRoomVersion,
+        hiddenFor: data.hiddenFor,
       };
     },
   });
@@ -536,7 +537,9 @@ async function applyCandidate(params: {
       matchData.isActive !== true ||
       !exactParticipants(matchData.userIds, normalized.userIds) ||
       (matchData.pairKey !== undefined &&
-        matchData.pairKey !== params.candidate.pairKey)
+        matchData.pairKey !== params.candidate.pairKey) ||
+      !Array.isArray(matchData.hiddenFor) ||
+      matchData.hiddenFor.length !== 0
     ) {
       throw new Error('Candidate room changed after the re-audit');
     }
@@ -545,7 +548,8 @@ async function applyCandidate(params: {
       pointerSnapshot.id !== params.candidate.pairKey ||
       pointerData.pairKey !== params.candidate.pairKey ||
       pointerData.activeMatchId !== params.candidate.matchId ||
-      pointerData.closedMatchId !== undefined
+      pointerData.closedMatchId !== undefined ||
+      pointerData.closedReason !== undefined
     ) {
       throw new Error('Pair pointer changed after the re-audit');
     }
@@ -558,13 +562,20 @@ async function applyCandidate(params: {
       throw new Error('Pair pointer is no longer unique during apply');
     }
 
-    if (matchData.directRoomVersion === 1) return 'already-marked';
-    if (matchData.directRoomVersion !== undefined) {
+    if (
+      matchData.directRoomVersion === 1 &&
+      matchData.pairKey === params.candidate.pairKey
+    ) return 'already-marked';
+    if (
+      matchData.directRoomVersion !== undefined &&
+      matchData.directRoomVersion !== 1
+    ) {
       throw new Error('Candidate acquired an unsupported marker');
     }
 
     transaction.update(matchRef, {
       directRoomVersion: 1,
+      pairKey: params.candidate.pairKey,
     });
     return 'updated';
   });

@@ -238,8 +238,21 @@ describe('users', () => {
 
 describe('chat rooms and messages', () => {
   beforeEach(async () => {
+    await seed('users/alice', {
+      displayName: 'Alice',
+      status: 'active',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await seed('users/bob', {
+      displayName: 'Bob',
+      status: 'active',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
     await seed('matches/room_ab', {
       userIds: ['alice', 'bob'],
+      pairKey: 'alice_bob',
       directRoomVersion: 1,
       isActive: true,
       hiddenFor: [],
@@ -254,6 +267,12 @@ describe('chat rooms and messages', () => {
       translationStatus: 'done',
       createdAt: new Date(),
     });
+    await seed('chatPairs/alice_bob', {
+      pairKey: 'alice_bob',
+      userIds: ['alice', 'bob'],
+      activeMatchId: 'room_ab',
+      updatedAt: new Date(),
+    });
   });
 
   test('participants can read a chat room and outsiders cannot', async () => {
@@ -263,7 +282,7 @@ describe('chat rooms and messages', () => {
     await assertFails(getDoc(doc(unauthDb(), 'matches/room_ab')));
   });
 
-  test('participants can list their active chat rooms', async () => {
+  test('direct room lists fail closed in favor of the server callable', async () => {
     const aliceDb = authDb('alice');
     const activeRoomsQuery = query(
       collection(aliceDb, 'matches'),
@@ -272,7 +291,7 @@ describe('chat rooms and messages', () => {
       where('directRoomVersion', '==', 1)
     );
 
-    await assertSucceeds(getDocs(activeRoomsQuery));
+    await assertFails(getDocs(activeRoomsQuery));
   });
 
   test('client cannot create, update, or delete chat room records', async () => {
@@ -324,21 +343,110 @@ describe('chat rooms and messages', () => {
     });
     await seed('matches/hidden_for_alice', {
       userIds: ['alice', 'bob'],
+      pairKey: 'alice_bob',
       directRoomVersion: 1,
       isActive: true,
       hiddenFor: ['alice'],
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      await updateDoc(doc(ctx.firestore(), 'chatPairs/alice_bob'), {
+        activeMatchId: 'hidden_for_alice',
+      });
+    });
 
     await assertFails(getDoc(doc(authDb('alice'), 'matches/closed_ab')));
     await assertFails(getDoc(doc(authDb('bob'), 'matches/closed_ab')));
     await assertFails(getDoc(doc(authDb('alice'), 'matches/closed_ab/messages/message_1')));
     await assertFails(getDoc(doc(authDb('alice'), 'matches/hidden_for_alice')));
-    await assertSucceeds(getDoc(doc(authDb('bob'), 'matches/hidden_for_alice')));
+    await assertFails(getDoc(doc(authDb('bob'), 'matches/hidden_for_alice')));
   });
 
-  test('reported or blocked rooms are removed from active chat list queries', async () => {
+  test('bilateral blocks deny both participants without revealing block direction', async () => {
+    await seed('users/bob/blocks/alice', {
+      blockedAt: new Date(),
+      targetUid: 'alice',
+    });
+
+    for (const uid of ['alice', 'bob']) {
+      await assertFails(getDoc(doc(authDb(uid), 'matches/room_ab')));
+      await assertFails(getDoc(doc(
+        authDb(uid),
+        'matches/room_ab/messages/message_1'
+      )));
+      await assertFails(getDocs(query(
+        collection(authDb(uid), 'matches'),
+        where('userIds', 'array-contains', uid),
+        where('isActive', '==', true),
+        where('directRoomVersion', '==', 1)
+      )));
+    }
+  });
+
+  test('unavailable callers or peers cannot read rooms or messages', async () => {
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      await updateDoc(doc(ctx.firestore(), 'users/bob'), {
+        status: 'banned',
+      });
+    });
+
+    for (const uid of ['alice', 'bob']) {
+      await assertFails(getDoc(doc(authDb(uid), 'matches/room_ab')));
+      await assertFails(getDoc(doc(
+        authDb(uid),
+        'matches/room_ab/messages/message_1'
+      )));
+    }
+  });
+
+  test('missing visibility state or a stale pair pointer fails closed', async () => {
+    await seed('matches/missing_hidden', {
+      userIds: ['alice', 'bob'],
+      pairKey: 'alice_bob',
+      directRoomVersion: 1,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      await updateDoc(doc(ctx.firestore(), 'chatPairs/alice_bob'), {
+        activeMatchId: 'missing_hidden',
+      });
+    });
+    await assertFails(getDoc(doc(authDb('alice'), 'matches/missing_hidden')));
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      await updateDoc(doc(ctx.firestore(), 'chatPairs/alice_bob'), {
+        activeMatchId: 'stale_room',
+      });
+    });
+    await assertFails(getDoc(doc(authDb('alice'), 'matches/room_ab')));
+    await assertFails(getDoc(doc(
+      authDb('bob'),
+      'matches/room_ab/messages/message_1'
+    )));
+  });
+
+  test('call state is hidden from blocked participants', async () => {
+    await seed('calls/call_ab', {
+      callerUid: 'alice',
+      calleeUid: 'bob',
+      matchId: 'room_ab',
+      status: 'ringing',
+    });
+    await assertSucceeds(getDoc(doc(authDb('alice'), 'calls/call_ab')));
+    await assertSucceeds(getDoc(doc(authDb('bob'), 'calls/call_ab')));
+
+    await seed('users/alice/blocks/bob', {
+      blockedAt: new Date(),
+      targetUid: 'bob',
+    });
+    await assertFails(getDoc(doc(authDb('alice'), 'calls/call_ab')));
+    await assertFails(getDoc(doc(authDb('bob'), 'calls/call_ab')));
+  });
+
+  test('reported or blocked rooms cannot be listed directly', async () => {
     await seed('matches/reported_ab', {
       userIds: ['alice', 'bob'],
       directRoomVersion: 1,
@@ -368,11 +476,7 @@ describe('chat rooms and messages', () => {
       where('directRoomVersion', '==', 1)
     );
 
-    const snap = await assertSucceeds(getDocs(activeRoomsQuery));
-    const ids = snap.docs.map((d) => d.id);
-    expect(ids).toContain('room_ab');
-    expect(ids).not.toContain('reported_ab');
-    expect(ids).not.toContain('blocked_ab');
+    await assertFails(getDocs(activeRoomsQuery));
   });
 
   test('chatPairs are server-owned and hidden from clients', async () => {

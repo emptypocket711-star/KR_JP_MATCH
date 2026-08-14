@@ -2,8 +2,13 @@ import { isAccountDeletedOrDeleting } from './callablePolicy';
 import { hasMinimumAge, parseValidDateOfBirth } from './birthDatePolicy';
 import { hasValidAdultIdentity } from './profileExposurePolicy';
 import { isOwnedProfileMediaPath } from './profilePhotoPolicy';
+import { pointBalanceTrustIssue } from './pointPolicy';
 
 export const initialOnboardingPointGrantAmount = 3;
+// Keep the deployed marker value stable. During the reviewed V1 transition,
+// both server reservation endpoints may mint this exact one-use shell.
+export const profileUploadOnboardingShellProvenance =
+  'reserveMediaUploadV2:profile-onboarding-shell:v1';
 export { profileMediaVisibilityVersion } from './profileMediaVisibilityPolicy';
 export { hasValidAdultIdentity };
 
@@ -31,17 +36,26 @@ const onboardingProfileFields = new Set([
 
 const requiredOnboardingProfileFields = [...onboardingProfileFields];
 
+const profileUploadOnboardingShellFields = new Set([
+  'uid',
+  'accountStatus',
+  'onboardingCompleted',
+  'onboardingShellProvenance',
+  'createdAt',
+  'updatedAt',
+  // These settings/credentials can be written through existing server-owned
+  // or narrowly scoped paths before profile onboarding completes.
+  'notificationsEnabled',
+  'nightQuietEnabled',
+  'uiLanguage',
+  'lastSeenAt',
+  'fcmToken',
+  'fcmTokenUpdatedAt',
+]);
+
 export type OnboardingPointGrantDecision =
   | {
       action: 'none';
-    }
-  | {
-      action: 'write-marker';
-      amount: 0;
-      balanceBefore: number;
-      balanceAfter: number;
-      source: 'onboarding_legacy_balance_v1';
-      legacyBalancePreserved: true;
     }
   | {
       action: 'grant';
@@ -106,38 +120,68 @@ export function onboardingPointEventId(uid: string): string {
   return `onboarding:${normalizedUid}:v1`;
 }
 
-export function decideInitialOnboardingPointGrant(input: {
-  initialPointEventExists: boolean;
-  currentKeyCount: unknown;
-}): OnboardingPointGrantDecision {
-  if (input.initialPointEventExists) return { action: 'none' };
-
-  if (input.currentKeyCount === undefined) {
-    return {
-      action: 'grant',
-      amount: initialOnboardingPointGrantAmount,
-      balanceBefore: 0,
-      balanceAfter: initialOnboardingPointGrantAmount,
-      source: 'onboarding_v1',
-      legacyBalancePreserved: false,
-    };
+export function isExactProfileUploadOnboardingShell(input: {
+  uid: string;
+  userData: Record<string, unknown> | undefined;
+}): boolean {
+  const { userData } = input;
+  if (
+    userData == null ||
+    userData.uid !== input.uid ||
+    userData.accountStatus !== 'onboarding' ||
+    userData.onboardingCompleted !== false ||
+    userData.onboardingShellProvenance !==
+      profileUploadOnboardingShellProvenance ||
+    userData.createdAt == null ||
+    userData.updatedAt == null
+  ) {
+    return false;
   }
 
-  if (
-    typeof input.currentKeyCount !== 'number' ||
-    !Number.isSafeInteger(input.currentKeyCount) ||
-    input.currentKeyCount < 0
-  ) {
-    throw new RangeError('existing keyCount must be a non-negative integer');
+  return Object.keys(userData).every(
+    (field) =>
+      field !== 'keyCount' &&
+      !field.startsWith('pointBalance') &&
+      profileUploadOnboardingShellFields.has(field)
+  );
+}
+
+export function decideInitialOnboardingPointGrant(input: {
+  uid: string;
+  userExists: boolean;
+  userData: Record<string, unknown> | undefined;
+  initialPointEventExists: boolean;
+}): OnboardingPointGrantDecision {
+  if (input.userExists && pointBalanceTrustIssue(input.userData) === null) {
+    return { action: 'none' };
+  }
+
+  if (input.initialPointEventExists) {
+    throw new RangeError(
+      'existing onboarding point evidence requires audited reconciliation'
+    );
+  }
+
+  const isNewUser = !input.userExists && input.userData === undefined;
+  const isServerCreatedShell =
+    input.userExists &&
+    isExactProfileUploadOnboardingShell({
+      uid: input.uid,
+      userData: input.userData,
+    });
+  if (!isNewUser && !isServerCreatedShell) {
+    throw new RangeError(
+      'untrusted existing point state requires audited reconciliation'
+    );
   }
 
   return {
-    action: 'write-marker',
-    amount: 0,
-    balanceBefore: input.currentKeyCount,
-    balanceAfter: input.currentKeyCount,
-    source: 'onboarding_legacy_balance_v1',
-    legacyBalancePreserved: true,
+    action: 'grant',
+    amount: initialOnboardingPointGrantAmount,
+    balanceBefore: 0,
+    balanceAfter: initialOnboardingPointGrantAmount,
+    source: 'onboarding_v1',
+    legacyBalancePreserved: false,
   };
 }
 

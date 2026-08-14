@@ -1,4 +1,4 @@
-export const DIRECT_ROOM_MIGRATION_POLICY_VERSION = 'direct-room-v1.1.0';
+export const DIRECT_ROOM_MIGRATION_POLICY_VERSION = 'direct-room-v1.2.0';
 export const DIRECT_ROOM_VERSION = 1;
 export const MAX_PARTICIPANT_ROOM_DOCUMENTS_PER_APPLY = 200;
 export const PARTICIPANT_ROOM_QUERY_LIMIT =
@@ -9,6 +9,7 @@ export interface ActiveMatchAuditRecord {
   userIds: unknown;
   pairKey?: unknown;
   directRoomVersion?: unknown;
+  hiddenFor?: unknown;
 }
 
 export interface ChatPairAuditRecord {
@@ -33,6 +34,7 @@ export type DirectRoomFindingCode =
   | 'duplicate-active-pair'
   | 'normalized-pair-key-collision'
   | 'match-pair-key-mismatch'
+  | 'active-match-hidden-state-invalid'
   | 'unsupported-direct-room-marker'
   | 'missing-chat-pair'
   | 'malformed-chat-pair'
@@ -160,6 +162,10 @@ function closedReasonsAgree(pointerReason: unknown, matchReason: unknown): boole
     pointerReason.length > 0 &&
     pointerReason === matchReason
   );
+}
+
+export function hasExactlyEmptyHiddenFor(value: unknown): value is [] {
+  return Array.isArray(value) && value.length === 0;
 }
 
 function addFinding(
@@ -346,6 +352,14 @@ export function classifyDirectRoomMigration(
         pairKey: normalized.pairKey,
       });
     }
+    if (!hasExactlyEmptyHiddenFor(match.hiddenFor)) {
+      safe = false;
+      addFinding(findings, findingKeys, {
+        code: 'active-match-hidden-state-invalid',
+        matchId: match.id,
+        pairKey: normalized.pairKey,
+      });
+    }
 
     const pointer = pointersById.get(normalized.pairKey);
     const participantPointers =
@@ -391,6 +405,15 @@ export function classifyDirectRoomMigration(
             pointer.closedMatchId.length > 0
               ? 'chat-pair-both-active-and-closed'
               : 'malformed-chat-pair',
+          matchId: match.id,
+          pairKey: normalized.pairKey,
+          pointerId: pointer.id,
+        });
+      }
+      if (pointer.closedReason !== undefined) {
+        safe = false;
+        addFinding(findings, findingKeys, {
+          code: 'malformed-chat-pair',
           matchId: match.id,
           pairKey: normalized.pairKey,
           pointerId: pointer.id,
@@ -454,7 +477,10 @@ export function classifyDirectRoomMigration(
       participantKey,
       pointerId: normalized.pairKey,
     };
-    if (match.directRoomVersion === DIRECT_ROOM_VERSION) {
+    if (
+      match.directRoomVersion === DIRECT_ROOM_VERSION &&
+      match.pairKey === normalized.pairKey
+    ) {
       healthy.push({ ...base, directRoomVersion: DIRECT_ROOM_VERSION });
     } else {
       candidates.push(base);

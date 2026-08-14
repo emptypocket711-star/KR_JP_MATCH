@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
 TARGET="${1:-}"
 EXPECTED_PROJECT="hana-e2ee6"
 EXPECTED_REGION="us-central1"
@@ -24,15 +27,20 @@ USAGE
   exit 64
 fi
 
-if [[ "$TARGET" == *"functions"* && "$TARGET" != "functions" ]]; then
-  echo "Functions must be deployed as the exact standalone target 'functions'." >&2
-  exit 64
-fi
+case "$TARGET" in
+  functions | firestore:indexes | "$STRICT_MEDIA_TARGET") ;;
+  *)
+    cat <<ERROR >&2
+Unsupported staging Firebase deploy target: $TARGET
 
-if [[ "$TARGET" == *"storage"* && "$TARGET" != "$STRICT_MEDIA_TARGET" ]]; then
-  echo "Staging Storage Rules must use the exact reviewed target '$STRICT_MEDIA_TARGET'." >&2
-  exit 64
-fi
+Allowed exact targets are:
+  functions
+  firestore:indexes
+  $STRICT_MEDIA_TARGET
+ERROR
+    exit 64
+    ;;
+esac
 
 if [[ "$TARGET" == *"functions"* && \
   "${HANA_FUNCTIONS_LIVE_REGION_CONFIRMED:-}" != "$EXPECTED_REGION" ]]; then
@@ -115,5 +123,9 @@ ERROR
   fi
 fi
 
-firebase deploy --project "$EXPECTED_PROJECT" --only "$TARGET" \
-  "${FIREBASE_DEPLOY_ARGS[@]}"
+if [[ ${#FIREBASE_DEPLOY_ARGS[@]} -gt 0 ]]; then
+  firebase deploy --project "$EXPECTED_PROJECT" --only "$TARGET" \
+    "${FIREBASE_DEPLOY_ARGS[@]}"
+else
+  firebase deploy --project "$EXPECTED_PROJECT" --only "$TARGET"
+fi

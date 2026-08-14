@@ -2,12 +2,15 @@ import * as admin from 'firebase-admin';
 import { createHash, randomUUID } from 'crypto';
 import * as functions from 'firebase-functions/v1';
 import { Translate } from '@google-cloud/translate/build/src/v2';
-import { RtcRole, RtcTokenBuilder } from 'agora-token';
 import { createAccountDeletionProcessor } from './accountDeletionWorker';
+import { buildScopedAgoraRtcToken } from './agoraRtcToken';
 import {
+  activePairRoomIdsForSafety,
   decideCloseActiveChatPolicy,
   decideStartChatPolicy,
+  isReusableDirectRoom,
   isExactDirectChatParticipants,
+  MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION,
 } from './chatPolicy';
 import {
   idempotentMessageDocumentId,
@@ -65,7 +68,6 @@ import {
   shouldQuarantineMediaCleanup,
 } from './mediaCleanupPolicy';
 import {
-  canApplyMessageSideEffects,
   shouldSendChatPush,
   targetLanguagesForMessage,
   translatedPreviewForRecipient,
@@ -74,6 +76,23 @@ import {
   activeAccountIssue,
   callableIdentityIssue,
 } from './callablePolicy';
+import {
+  callEntitlementIssue,
+  callExtensionOperationId,
+  callRingingTtlSeconds,
+  callTokenLifetimeSeconds,
+  decideActiveCallReplacement,
+  decideCallExtension,
+  decideCallExtensionReplay,
+  incomingCallNotificationTtlMillis,
+  JoinableCallStatus,
+  normalizeCallExtensionRequestId,
+  videoSegmentPoints as VIDEO_SEGMENT_POINTS,
+  videoSegmentSeconds as VIDEO_SEGMENT_SECONDS,
+  voiceExtensionPoints as VOICE_EXTENSION_POINTS,
+  voiceExtensionSeconds as VOICE_EXTENSION_SECONDS,
+  voiceFreeSeconds as VOICE_FREE_SECONDS,
+} from './callEntitlementPolicy';
 import { ageOnReferenceDate, parseValidDateOfBirth } from './birthDatePolicy';
 import { publicAgeFromPrivateProfile } from './publicProfilePolicy';
 import { deprecatedLikeResult } from './legacyDiscoveryPolicy';
@@ -81,6 +100,7 @@ import {
   decideInitialOnboardingPointGrant,
   onboardingCompletionBlockReason,
   onboardingPointEventId,
+  profileUploadOnboardingShellProvenance,
   validateOnboardingProfileInput,
 } from './onboardingPolicy';
 import {
@@ -123,12 +143,15 @@ import {
   dailyLoungePostPointGrantAmount,
   isAlreadyGrantedPlayPurchaseRecord,
   isStorePointPurchaseEnabled,
+  isValidPointBalance,
   isValidPointPlatform,
   isValidPurchaseToken,
   kstDateKey,
   pointAmountForProduct,
   pointBalanceAfterConsume,
   pointBalanceAfterGrant,
+  pointBalanceTrustIssue,
+  pointBalanceTrustVersion,
   shouldGrantDailyLoungePostPoints,
   shouldVerifyPlayBilling,
 } from './pointPolicy';
@@ -139,13 +162,12 @@ import {
 import { verifyGooglePlayProductPurchase } from './playBillingVerifier';
 import {
   fcmTokenOwnershipId,
+  retryableFcmRegistrationDetails,
   shouldClearOwnedFcmToken,
 } from './fcmTokenPolicy';
 import {
   buildReportContentEvidence,
-  canUseRequestedMatchForSafety,
   clientReportIntakeDecision,
-  closedChatHiddenParticipants,
   isValidReportReason,
   normalizeReportContentContext,
   ReportContentContext,
@@ -204,12 +226,6 @@ const accountDeletionProcessor = createAccountDeletionProcessor({
   bucket: admin.storage().bucket(),
 });
 const translate = new Translate();
-const VOICE_FREE_SECONDS = 5 * 60;
-const VOICE_EXTENSION_SECONDS = 10 * 60;
-const VIDEO_SEGMENT_SECONDS = 10 * 60;
-const VOICE_EXTENSION_POINTS = 1;
-const VIDEO_SEGMENT_POINTS = 3;
-const CALL_TOKEN_TTL_SECONDS = 60 * 60;
 // firebase-functions v1 FunctionBuilder.runWith mutates the builder. Every
 // specialized runtime must therefore start from a fresh regional builder so
 // its options cannot leak into later callables or triggers.
@@ -260,6 +276,8 @@ interface PublicProfile {
 
 interface QuotaEventData {
   uid: string;
+  callId?: string;
+  clientRequestId?: string;
   eventType: 'grant' | 'consume';
   amount: number;
   reason: string;
@@ -283,6 +301,45 @@ interface StorePointPurchaseRequest {
   purchaseId?: string;
   verificationSource?: string;
   appAccountToken?: string;
+}
+
+function pointBalanceReviewRequired(): never {
+  throw new functions.https.HttpsError(
+    'failed-precondition',
+    'Point balance requires account review'
+  );
+}
+
+function requireTrustedPointBalance(
+  userData: Record<string, unknown> | undefined
+): number {
+  if (pointBalanceTrustIssue(userData) !== null) {
+    return pointBalanceReviewRequired();
+  }
+  const balance = userData?.keyCount;
+  if (!isValidPointBalance(balance)) {
+    return pointBalanceReviewRequired();
+  }
+  return balance;
+}
+
+function pointBalanceForServerGrant(
+  userData: Record<string, unknown> | undefined
+): number {
+  const issue = pointBalanceTrustIssue(userData);
+  if (issue === null) return requireTrustedPointBalance(userData);
+
+  const balance = userData?.keyCount;
+  if (
+    issue === 'untrusted-balance' &&
+    userData?.pointBalanceTrustVersion === undefined &&
+    userData?.pointBalanceQuarantined !== true &&
+    balance === 0 &&
+    isValidPointBalance(balance)
+  ) {
+    return balance;
+  }
+  return pointBalanceReviewRequired();
 }
 
 // ============================================================================
@@ -428,7 +485,7 @@ async function verifyAndGrantAppleStorePointPurchase(
         existingTransaction.uid === uid &&
         existingTransaction.productId === data.productId
       ) {
-        const keyCount = (userData?.keyCount as number) ?? 0;
+        const keyCount = requireTrustedPointBalance(userData);
         return { keyCount, alreadyProcessed: true };
       }
       throw new functions.https.HttpsError(
@@ -437,7 +494,7 @@ async function verifyAndGrantAppleStorePointPurchase(
       );
     }
 
-    const currentKeyCount = (userData?.keyCount as number) ?? 0;
+    const currentKeyCount = pointBalanceForServerGrant(userData);
     const nextKeyCount = pointBalanceAfterGrant(
       currentKeyCount,
       productPoints
@@ -456,7 +513,8 @@ async function verifyAndGrantAppleStorePointPurchase(
     };
 
     tx.update(userRef, {
-      keyCount: admin.firestore.FieldValue.increment(productPoints),
+      keyCount: nextKeyCount,
+      pointBalanceTrustVersion,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     tx.create(transactionRef, {
@@ -561,8 +619,10 @@ async function verifyAndGrantGooglePlayPointPurchase(
       purchaseSnap.exists &&
       isAlreadyGrantedPlayPurchaseRecord(purchaseData, uid)
     ) {
+      requireTrustedPointBalance(userSnap.data());
       return 'granted' as const;
     }
+    pointBalanceForServerGrant(userSnap.data());
     const leaseUntilMillis =
       purchaseData?.leaseUntil instanceof admin.firestore.Timestamp
         ? purchaseData.leaseUntil.toMillis()
@@ -636,7 +696,7 @@ async function verifyAndGrantGooglePlayPointPurchase(
     return {
       ok: true,
       extraQuotaGranted: 0,
-      keyCount: (currentUser.data()?.keyCount as number) ?? 0,
+      keyCount: requireTrustedPointBalance(currentUser.data()),
       alreadyProcessed: true,
     };
   }
@@ -722,9 +782,10 @@ async function verifyAndGrantGooglePlayPointPurchase(
       );
     }
     if (freshPurchaseSnap.data()?.status === 'granted') {
+      const currentKeyCount = requireTrustedPointBalance(freshUserData);
       return {
-        previousKeyCount: (freshUserData?.keyCount as number) ?? 0,
-        keyCount: (freshUserData?.keyCount as number) ?? 0,
+        previousKeyCount: currentKeyCount,
+        keyCount: currentKeyCount,
         alreadyProcessed: true,
       };
     }
@@ -738,7 +799,7 @@ async function verifyAndGrantGooglePlayPointPurchase(
       );
     }
 
-    const currentKeyCount = (freshUserData?.keyCount as number) ?? 0;
+    const currentKeyCount = pointBalanceForServerGrant(freshUserData);
     const nextKeyCount = pointBalanceAfterGrant(
       currentKeyCount,
       productPoints
@@ -758,7 +819,8 @@ async function verifyAndGrantGooglePlayPointPurchase(
     };
 
     tx.update(userRef, {
-      keyCount: admin.firestore.FieldValue.increment(productPoints),
+      keyCount: nextKeyCount,
+      pointBalanceTrustVersion,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     tx.update(purchaseRef, {
@@ -897,38 +959,198 @@ function assertNoAccountDeletionJob(
   }
 }
 
+function directRoomUnavailable(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'permission-denied',
+    'Chat room is unavailable'
+  );
+}
+
+function directChatTargetUnavailable(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'permission-denied',
+    'Target user is unavailable'
+  );
+}
+
+function reusableDirectRoomSnapshots(params: {
+  matchId: string;
+  matchSnap: FirebaseFirestore.DocumentSnapshot;
+  pairSnap: FirebaseFirestore.DocumentSnapshot;
+  expectedUserIds: readonly string[];
+  pairKey: string;
+}): boolean {
+  const matchData = params.matchSnap.data();
+  const pairData = params.pairSnap.data();
+  return isReusableDirectRoom({
+    matchId: params.matchId,
+    matchExists: params.matchSnap.exists,
+    matchActive: matchData?.isActive === true,
+    matchUserIds: matchData?.userIds,
+    matchPairKey: matchData?.pairKey,
+    directRoomVersion: matchData?.directRoomVersion,
+    hiddenFor: matchData?.hiddenFor,
+    expectedUserIds: params.expectedUserIds,
+    pointerExists: params.pairSnap.exists,
+    pointerId: params.pairSnap.id,
+    pointerUserIds: pairData?.userIds,
+    pointerPairKey: pairData?.pairKey,
+    pointerActiveMatchId: pairData?.activeMatchId,
+    pointerClosedMatchId: pairData?.closedMatchId,
+    pointerClosedReason: pairData?.closedReason,
+  }) && params.pairSnap.id === params.pairKey;
+}
+
+interface DirectRoomSideEffectContext {
+  senderData: FirebaseFirestore.DocumentData;
+  recipientData: FirebaseFirestore.DocumentData;
+}
+
+async function readAuthorizedDirectRoomSideEffectContextInTransaction(
+  tx: FirebaseFirestore.Transaction,
+  params: {
+    matchId: string;
+    senderUid: string;
+    recipientUid: string;
+  }
+): Promise<DirectRoomSideEffectContext | null> {
+  const expectedUserIds = [params.senderUid, params.recipientUid].sort();
+  const pairKey = expectedUserIds.join('_');
+  const matchRef = db.collection('matches').doc(params.matchId);
+  const pairRef = db.collection('chatPairs').doc(pairKey);
+  const senderRef = db.collection('users').doc(params.senderUid);
+  const recipientRef = db.collection('users').doc(params.recipientUid);
+  const [
+    matchSnap,
+    pairSnap,
+    senderSnap,
+    recipientSnap,
+    senderBlockSnap,
+    recipientBlockSnap,
+  ] = await Promise.all([
+    tx.get(matchRef),
+    tx.get(pairRef),
+    tx.get(senderRef),
+    tx.get(recipientRef),
+    tx.get(senderRef.collection('blocks').doc(params.recipientUid)),
+    tx.get(recipientRef.collection('blocks').doc(params.senderUid)),
+  ]);
+  if (
+    activeAccountIssue({
+      exists: senderSnap.exists,
+      userData: senderSnap.data(),
+    }) !== null ||
+    activeAccountIssue({
+      exists: recipientSnap.exists,
+      userData: recipientSnap.data(),
+    }) !== null ||
+    senderBlockSnap.exists ||
+    recipientBlockSnap.exists ||
+    !reusableDirectRoomSnapshots({
+      matchId: params.matchId,
+      matchSnap,
+      pairSnap,
+      expectedUserIds,
+      pairKey,
+    })
+  ) {
+    return null;
+  }
+  return {
+    senderData: senderSnap.data()!,
+    recipientData: recipientSnap.data()!,
+  };
+}
+
+async function readAuthorizedDirectRoomSideEffectContext(params: {
+  matchId: string;
+  senderUid: string;
+  recipientUid: string;
+}): Promise<DirectRoomSideEffectContext | null> {
+  return db.runTransaction((tx) =>
+    readAuthorizedDirectRoomSideEffectContextInTransaction(tx, params)
+  );
+}
+
+async function applyAuthorizedMessageRecipientState(params: {
+  matchId: string;
+  senderUid: string;
+  recipientUid: string;
+  localizedPreview: string | null;
+}): Promise<DirectRoomSideEffectContext | null> {
+  return db.runTransaction(async (tx) => {
+    const access = await readAuthorizedDirectRoomSideEffectContextInTransaction(
+      tx,
+      params
+    );
+    if (access == null) return null;
+    tx.update(db.collection('matches').doc(params.matchId), {
+      [`unread.${params.recipientUid}`]: admin.firestore.FieldValue.increment(1),
+      ...(params.localizedPreview == null
+        ? {}
+        : {
+            [`lastMessagePreviewFor.${params.recipientUid}`]:
+              params.localizedPreview,
+          }),
+    });
+    return access;
+  });
+}
+
 async function assertActiveDirectRoomMutation(
   tx: FirebaseFirestore.Transaction,
   uid: string,
+  matchId: string,
   matchData: FirebaseFirestore.DocumentData
 ): Promise<string> {
   const userIds = matchData.userIds as string[] | undefined;
   if (!isExactDirectChatParticipants(userIds) || !userIds.includes(uid)) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'User not in this match'
-    );
+    throw directRoomUnavailable();
   }
   if (matchData.isActive !== true) {
-    throw new functions.https.HttpsError('permission-denied', 'Match is not active');
+    throw directRoomUnavailable();
   }
-  if (Array.isArray(matchData.hiddenFor) && matchData.hiddenFor.length > 0) {
-    throw new functions.https.HttpsError('permission-denied', 'Match is not visible');
+  if (!Array.isArray(matchData.hiddenFor) || matchData.hiddenFor.length > 0) {
+    throw directRoomUnavailable();
   }
   const otherUid = userIds.find((participant) => participant !== uid)!;
+  const expectedUserIds = [uid, otherUid].sort();
+  const pairKey = expectedUserIds.join('_');
   const callerRef = db.collection('users').doc(uid);
   const otherRef = db.collection('users').doc(otherUid);
-  const [otherSnap, callerBlock, otherBlock] = await Promise.all([
+  const [otherSnap, callerBlock, otherBlock, pairSnap] = await Promise.all([
     tx.get(otherRef),
     tx.get(callerRef.collection('blocks').doc(otherUid)),
     tx.get(otherRef.collection('blocks').doc(uid)),
+    tx.get(db.collection('chatPairs').doc(pairKey)),
   ]);
-  assertActiveAccountSnapshot(otherSnap, 'Chat participant');
+  if (activeAccountIssue({
+    exists: otherSnap.exists,
+    userData: otherSnap.data(),
+  }) !== null) {
+    throw directRoomUnavailable();
+  }
   if (callerBlock.exists || otherBlock.exists) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat is blocked between these users'
-    );
+    throw directRoomUnavailable();
+  }
+  if (!isReusableDirectRoom({
+    matchId,
+    matchExists: true,
+    matchActive: matchData.isActive === true,
+    matchUserIds: matchData.userIds,
+    matchPairKey: matchData.pairKey,
+    directRoomVersion: matchData.directRoomVersion,
+    hiddenFor: matchData.hiddenFor,
+    expectedUserIds,
+    pointerExists: pairSnap.exists,
+    pointerId: pairSnap.id,
+    pointerUserIds: pairSnap.data()?.userIds,
+    pointerPairKey: pairSnap.data()?.pairKey,
+    pointerActiveMatchId: pairSnap.data()?.activeMatchId,
+    pointerClosedMatchId: pairSnap.data()?.closedMatchId,
+    pointerClosedReason: pairSnap.data()?.closedReason,
+  })) {
+    throw directRoomUnavailable();
   }
   return otherUid;
 }
@@ -945,21 +1167,21 @@ async function assertActiveMediaUploadRoom(
     !matchSnap.exists ||
     matchData?.directRoomVersion !== 1 ||
     matchData?.isActive !== true ||
-    (Array.isArray(matchData?.hiddenFor) && matchData.hiddenFor.length > 0)
+    !Array.isArray(matchData?.hiddenFor) ||
+    matchData.hiddenFor.length > 0
   ) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat room is no longer available for media upload'
-    );
+    throw directRoomUnavailable();
   }
   const userIds = matchData?.userIds as string[] | undefined;
   if (!isExactDirectChatParticipants(userIds) || !userIds.includes(uid)) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat room participants are invalid'
-    );
+    throw directRoomUnavailable();
   }
-  const otherUid = await assertActiveDirectRoomMutation(tx, uid, matchData);
+  const otherUid = await assertActiveDirectRoomMutation(
+    tx,
+    uid,
+    matchId,
+    matchData
+  );
   const pairKey = [uid, otherUid].sort().join('_');
   const pairSnap = await tx.get(db.collection('chatPairs').doc(pairKey));
   if (
@@ -968,10 +1190,7 @@ async function assertActiveMediaUploadRoom(
     !isExactDirectChatParticipants(pairSnap.data()?.userIds, [uid, otherUid]) ||
     pairSnap.data()?.activeMatchId !== matchId
   ) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat room is no longer the active room for this pair'
-    );
+    throw directRoomUnavailable();
   }
 }
 
@@ -1016,8 +1235,19 @@ async function writeMessageTranslationForActiveAccount(
   const otherUserRef = db.collection('users').doc(otherUid);
   const callerBlockRef = userRef.collection('blocks').doc(otherUid);
   const recipientBlockRef = otherUserRef.collection('blocks').doc(uid);
+  const expectedUserIds = [uid, otherUid].sort();
+  const pairKey = expectedUserIds.join('_');
+  const pairRef = db.collection('chatPairs').doc(pairKey);
   await db.runTransaction(async (tx) => {
-    const [userSnap, otherUserSnap, matchSnap, messageSnap, callerBlock, recipientBlock] =
+    const [
+      userSnap,
+      otherUserSnap,
+      matchSnap,
+      messageSnap,
+      callerBlock,
+      recipientBlock,
+      pairSnap,
+    ] =
       await Promise.all([
       tx.get(userRef),
       tx.get(otherUserRef),
@@ -1025,22 +1255,25 @@ async function writeMessageTranslationForActiveAccount(
       tx.get(messageRef),
       tx.get(callerBlockRef),
       tx.get(recipientBlockRef),
+      tx.get(pairRef),
     ]);
     assertActiveAccountSnapshot(userSnap);
-    assertActiveAccountSnapshot(otherUserSnap, 'Chat participant');
     if (
-      !matchSnap.exists ||
-      matchSnap.data()?.isActive !== true ||
-      !isExactDirectChatParticipants(matchSnap.data()?.userIds, [uid, otherUid]) ||
-      (Array.isArray(matchSnap.data()?.hiddenFor) &&
-        matchSnap.data()!.hiddenFor.length > 0) ||
+      activeAccountIssue({
+        exists: otherUserSnap.exists,
+        userData: otherUserSnap.data(),
+      }) !== null ||
       callerBlock.exists ||
-      recipientBlock.exists
+      recipientBlock.exists ||
+      !reusableDirectRoomSnapshots({
+        matchId: matchRef.id,
+        matchSnap,
+        pairSnap,
+        expectedUserIds,
+        pairKey,
+      })
     ) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'Chat room is no longer available'
-      );
+      throw directRoomUnavailable();
     }
     if (!messageSnap.exists) {
       throw new functions.https.HttpsError('not-found', 'Message not found');
@@ -1308,42 +1541,246 @@ function agoraUidForFirebaseUid(uid: string): number {
   return digest.readUInt32BE(0) || 1;
 }
 
+const CALL_UNAVAILABLE_MESSAGE = 'Call is unavailable';
+const CALL_CLOSED_MESSAGE = 'Call is closed';
+
+function callUnavailableError(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'permission-denied',
+    CALL_UNAVAILABLE_MESSAGE
+  );
+}
+
+function callClosedError(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'failed-precondition',
+    CALL_CLOSED_MESSAGE
+  );
+}
+
 function buildAgoraRtcToken(params: {
   appId: string;
   appCertificate: string;
   channelName: string;
   uid: string;
+  callType: 'voice' | 'video';
+  paidUntilAtMillis: number;
 }): { rtcUid: number; token: string; expiresAt: number } {
+  const nowMillis = Date.now();
+  const lifetimeSeconds = callTokenLifetimeSeconds({
+    paidUntilAtMillis: params.paidUntilAtMillis,
+    nowMillis,
+  });
+  if (lifetimeSeconds == null) {
+    throw callClosedError();
+  }
   const rtcUid = agoraUidForFirebaseUid(params.uid);
-  const expiresAt = Math.floor(Date.now() / 1000) + CALL_TOKEN_TTL_SECONDS;
+  const expiresAt = Math.floor(nowMillis / 1000) + lifetimeSeconds;
   return {
     rtcUid,
     expiresAt,
-    token: RtcTokenBuilder.buildTokenWithUid(
-      params.appId,
-      params.appCertificate,
-      params.channelName,
-      rtcUid,
-      RtcRole.PUBLISHER,
-      CALL_TOKEN_TTL_SECONDS,
-      CALL_TOKEN_TTL_SECONDS
-    ),
+    token: buildScopedAgoraRtcToken({
+      appId: params.appId,
+      appCertificate: params.appCertificate,
+      channelName: params.channelName,
+      uid: rtcUid,
+      callType: params.callType,
+      lifetimeSeconds,
+    }),
+  };
+}
+
+interface ValidatedCallEntitlement {
+  callData: FirebaseFirestore.DocumentData;
+  callerUid: string;
+  calleeUid: string;
+  matchId: string;
+  callType: 'voice' | 'video';
+  roomName: string;
+  ringingExpiresAtMillis: number | null;
+  paidUntilAtMillis: number | null;
+  callerRef: FirebaseFirestore.DocumentReference;
+  calleeRef: FirebaseFirestore.DocumentReference;
+  requesterRef: FirebaseFirestore.DocumentReference;
+  callerAccountSnap: FirebaseFirestore.DocumentSnapshot;
+  calleeAccountSnap: FirebaseFirestore.DocumentSnapshot;
+  requesterAccountSnap: FirebaseFirestore.DocumentSnapshot;
+  activeCallRef: FirebaseFirestore.DocumentReference;
+  now: FirebaseFirestore.Timestamp;
+}
+
+async function requireCallEntitlement(
+  tx: FirebaseFirestore.Transaction,
+  params: {
+    callRef: FirebaseFirestore.DocumentReference;
+    callId: string;
+    requesterUid: string;
+    allowedStatuses: readonly JoinableCallStatus[];
+    requirePaidEntitlement: boolean;
+  }
+): Promise<ValidatedCallEntitlement> {
+  const callSnap = await tx.get(params.callRef);
+  const callData = callSnap.data() ?? {};
+  const callerUid = callData.callerUid;
+  const calleeUid = callData.calleeUid;
+  const matchId = callData.matchId;
+  if (
+    !callSnap.exists ||
+    typeof callerUid !== 'string' ||
+    callerUid.length === 0 ||
+    typeof calleeUid !== 'string' ||
+    calleeUid.length === 0 ||
+    callerUid === calleeUid ||
+    typeof matchId !== 'string' ||
+    matchId.length === 0 ||
+    !isExactDirectChatParticipants(
+      callData.participantUids,
+      [callerUid, calleeUid]
+    ) ||
+    !callData.participantUids.includes(params.requesterUid)
+  ) {
+    throw callUnavailableError();
+  }
+
+  const callerRef = db.collection('users').doc(callerUid);
+  const calleeRef = db.collection('users').doc(calleeUid);
+  const matchRef = db.collection('matches').doc(matchId);
+  const pairKey = [callerUid, calleeUid].sort().join('_');
+  const pairRef = db.collection('chatPairs').doc(pairKey);
+  const callerBlockRef = callerRef.collection('blocks').doc(calleeUid);
+  const calleeBlockRef = calleeRef.collection('blocks').doc(callerUid);
+  const activeCallRef = db.collection('activeCalls').doc(matchId);
+  const [
+    callerAccountSnap,
+    calleeAccountSnap,
+    matchSnap,
+    pairSnap,
+    callerBlockSnap,
+    calleeBlockSnap,
+    activeCallSnap,
+  ] = await Promise.all([
+    tx.get(callerRef),
+    tx.get(calleeRef),
+    tx.get(matchRef),
+    tx.get(pairRef),
+    tx.get(callerBlockRef),
+    tx.get(calleeBlockRef),
+    tx.get(activeCallRef),
+  ]);
+  const matchData = matchSnap.data() ?? {};
+  const pairData = pairSnap.data() ?? {};
+  const activeCallData = activeCallSnap.data() ?? {};
+  const ringingExpiresAtMillis =
+    callData.ringingExpiresAt?.toMillis?.() ?? null;
+  const paidUntilAtMillis = callData.paidUntilAt?.toMillis?.() ?? null;
+  const now = admin.firestore.Timestamp.now();
+  const issue = callEntitlementIssue({
+    callExists: callSnap.exists,
+    callId: params.callId,
+    requesterUid: params.requesterUid,
+    callerUid,
+    calleeUid,
+    participantUids: callData.participantUids,
+    callMatchId: matchId,
+    callType: callData.type,
+    roomName: callData.roomName,
+    callStatus: callData.status,
+    ringingExpiresAtMillis,
+    paidUntilAtMillis,
+    callerActive: activeAccountIssue({
+      exists: callerAccountSnap.exists,
+      userData: callerAccountSnap.data(),
+    }) === null,
+    calleeActive: activeAccountIssue({
+      exists: calleeAccountSnap.exists,
+      userData: calleeAccountSnap.data(),
+    }) === null,
+    matchExists: matchSnap.exists,
+    matchActive: matchData.isActive === true,
+    matchParticipantUids: matchData.userIds,
+    matchPairKey: matchData.pairKey,
+    matchDirectRoomVersion: matchData.directRoomVersion,
+    matchHiddenFor: matchData.hiddenFor,
+    pairExists: pairSnap.exists,
+    pairId: pairSnap.id,
+    pairPairKey: pairData.pairKey,
+    pairActiveMatchId: pairData.activeMatchId,
+    pairParticipantUids: pairData.userIds,
+    pairClosedMatchId: pairData.closedMatchId,
+    pairClosedReason: pairData.closedReason,
+    callerBlockedCallee: callerBlockSnap.exists,
+    calleeBlockedCaller: calleeBlockSnap.exists,
+    activeCallExists: activeCallSnap.exists,
+    activeCallId: activeCallData.callId,
+    activeCallMatchId: activeCallData.matchId,
+    activeCallParticipantUids: activeCallData.participantUids,
+    activeCallStatus: activeCallData.status,
+    allowedStatuses: params.allowedStatuses,
+    requirePaidEntitlement: params.requirePaidEntitlement,
+    nowMillis: now.toMillis(),
+  });
+  if (issue === 'closed') throw callClosedError();
+  if (issue !== null) throw callUnavailableError();
+
+  const requesterIsCaller = params.requesterUid === callerUid;
+  return {
+    callData,
+    callerUid,
+    calleeUid,
+    matchId,
+    callType: callData.type as 'voice' | 'video',
+    roomName: callData.roomName as string,
+    ringingExpiresAtMillis,
+    paidUntilAtMillis,
+    callerRef,
+    calleeRef,
+    requesterRef: requesterIsCaller ? callerRef : calleeRef,
+    callerAccountSnap,
+    calleeAccountSnap,
+    requesterAccountSnap: requesterIsCaller
+      ? callerAccountSnap
+      : calleeAccountSnap,
+    activeCallRef,
+    now,
   };
 }
 
 async function notifyIncomingCall(params: {
+  callerUid: string;
   callerName: string;
   callId: string;
   matchId: string;
   recipientUid: string;
   type: 'voice' | 'video';
 }): Promise<void> {
-  const recipientSnap = await db.collection('users').doc(params.recipientUid).get();
-  const recipientData = recipientSnap.data();
-  if (activeAccountIssue({
-    exists: recipientSnap.exists,
-    userData: recipientData,
-  }) !== null) return;
+  let entitlement: ValidatedCallEntitlement;
+  try {
+    entitlement = await db.runTransaction((tx) => requireCallEntitlement(tx, {
+      callRef: db.collection('calls').doc(params.callId),
+      callId: params.callId,
+      requesterUid: params.callerUid,
+      allowedStatuses: ['ringing'],
+      requirePaidEntitlement: false,
+    }));
+  } catch (_) {
+    return;
+  }
+  if (
+    entitlement.callerUid !== params.callerUid ||
+    entitlement.calleeUid !== params.recipientUid ||
+    entitlement.matchId !== params.matchId ||
+    entitlement.callData.type !== params.type
+  ) return;
+
+  const ringingExpiresAtMillis = entitlement.ringingExpiresAtMillis;
+  if (ringingExpiresAtMillis == null) return;
+  const notificationTtlMillis = incomingCallNotificationTtlMillis({
+    ringingExpiresAtMillis,
+    nowMillis: Date.now(),
+  });
+  if (notificationTtlMillis == null) return;
+
+  const recipientData = entitlement.calleeAccountSnap.data();
   const fcmToken: string | null = recipientData?.fcmToken ?? null;
   const notificationsEnabled: boolean =
     recipientData?.notificationsEnabled ?? true;
@@ -1363,11 +1800,18 @@ async function notifyIncomingCall(params: {
         callId: params.callId,
         matchId: params.matchId,
         callType: params.type,
+        ringingExpiresAt: ringingExpiresAtMillis.toString(),
       },
       android: {
         priority: 'high',
+        ttl: notificationTtlMillis,
       },
       apns: {
+        headers: {
+          'apns-expiration': Math.floor(
+            ringingExpiresAtMillis / 1000
+          ).toString(),
+        },
         payload: {
           aps: {
             sound: 'default',
@@ -1381,16 +1825,13 @@ async function notifyIncomingCall(params: {
 }
 
 async function notifyNewDirectChat(params: {
-  starterName: string;
   matchId: string;
+  senderUid: string;
   recipientUid: string;
 }): Promise<void> {
-  const recipientSnap = await db.collection('users').doc(params.recipientUid).get();
-  const recipientData = recipientSnap.data();
-  if (activeAccountIssue({
-    exists: recipientSnap.exists,
-    userData: recipientData,
-  }) !== null) return;
+  const access = await readAuthorizedDirectRoomSideEffectContext(params);
+  if (access == null) return;
+  const { recipientData, senderData } = access;
   const fcmToken: string | null = recipientData?.fcmToken ?? null;
   const notificationsEnabled: boolean =
     recipientData?.notificationsEnabled ?? true;
@@ -1400,7 +1841,7 @@ async function notifyNewDirectChat(params: {
     await admin.messaging().send({
       token: fcmToken,
       notification: {
-        title: params.starterName,
+        title: senderData.displayName ?? 'Hana',
         body: '새 대화방이 열렸어요',
       },
       data: {
@@ -1984,125 +2425,215 @@ async function reserveTranslationQuota(
 async function findMatch(uidA: string, uidB: string): Promise<string | null> {
   const ids = [uidA, uidB].sort();
   const pairKey = ids.join('_');
-  const pairSnap = await db.collection('chatPairs').doc(pairKey).get();
-  const activeMatchId = pairSnap.data()?.activeMatchId;
-
-  if (typeof activeMatchId === 'string' && activeMatchId.length > 0) {
-    const matchSnap = await db.collection('matches').doc(activeMatchId).get();
-    const userIds = matchSnap.data()?.userIds as string[] | undefined;
-    if (
-      matchSnap.exists &&
-      matchSnap.data()?.isActive === true &&
-      isExactDirectChatParticipants(userIds, ids)
-    ) {
-      return activeMatchId;
+  const pairRef = db.collection('chatPairs').doc(pairKey);
+  return db.runTransaction(async (tx) => {
+    const pairSnap = await tx.get(pairRef);
+    const activeMatchId = pairSnap.data()?.activeMatchId;
+    if (typeof activeMatchId !== 'string' || activeMatchId.length === 0) {
+      return null;
     }
-  }
-
-  // Legacy fallback for deterministic room IDs created before chatPairs.
-  const legacyMatchId = pairKey;
-  const matchSnap = await db.collection('matches').doc(legacyMatchId).get();
-
-  if (
-    matchSnap.exists &&
-    matchSnap.data()?.isActive === true &&
-    isExactDirectChatParticipants(matchSnap.data()?.userIds, ids)
-  ) {
-    const pairRef = db.collection('chatPairs').doc(pairKey);
-    const migrated = await db.runTransaction(async (tx) => {
-      const [freshMatch, freshPair] = await Promise.all([
-        tx.get(matchSnap.ref),
-        tx.get(pairRef),
-      ]);
-      if (
-        !freshMatch.exists ||
-        freshMatch.data()?.isActive !== true ||
-        !isExactDirectChatParticipants(freshMatch.data()?.userIds, ids)
-      ) {
-        return false;
-      }
-      const freshActiveId = freshPair.data()?.activeMatchId;
-      if (
-        typeof freshActiveId === 'string' &&
-        freshActiveId.length > 0 &&
-        freshActiveId !== legacyMatchId
-      ) {
-        return false;
-      }
-      tx.set(pairRef, {
-        pairKey,
-        userIds: ids,
-        activeMatchId: legacyMatchId,
-        closedMatchId: admin.firestore.FieldValue.delete(),
-        closedReason: admin.firestore.FieldValue.delete(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-      return true;
-    });
-    return migrated ? legacyMatchId : null;
-  }
-
-  return null;
+    const matchSnap = await tx.get(
+      db.collection('matches').doc(activeMatchId)
+    );
+    return reusableDirectRoomSnapshots({
+      matchId: activeMatchId,
+      matchSnap,
+      pairSnap,
+      expectedUserIds: ids,
+      pairKey,
+    }) ? activeMatchId : null;
+  });
 }
 
-async function closePairChatForSafety(params: {
-  actorUid: string;
-  targetUid: string;
-  candidateMatchId: string | null;
-  closedReason: 'blocked' | 'reported';
-}): Promise<string | null> {
-  if (!params.candidateMatchId) return null;
+type SafetyClosureReason = 'blocked' | 'reported' | 'left_chat';
 
+interface ActiveCallClosureSnapshot {
+  pointerRef: FirebaseFirestore.DocumentReference;
+  pointerExists: boolean;
+  callRef: FirebaseFirestore.DocumentReference | null;
+  callData: FirebaseFirestore.DocumentData | null;
+  closeCall: boolean;
+}
+
+async function readActiveCallClosures(
+  tx: FirebaseFirestore.Transaction,
+  matchIds: readonly string[],
+  expectedUserIds: readonly string[]
+): Promise<ActiveCallClosureSnapshot[]> {
+  const pointerRefs = matchIds.map((matchId) =>
+    db.collection('activeCalls').doc(matchId)
+  );
+  const pointerSnaps = await Promise.all(pointerRefs.map((ref) => tx.get(ref)));
+  const callRefs = pointerSnaps.map((snapshot) => {
+    const callId = snapshot.data()?.callId;
+    return typeof callId === 'string' && callId.length > 0
+      ? db.collection('calls').doc(callId)
+      : null;
+  });
+  const callSnaps = await Promise.all(callRefs.map((ref) =>
+    ref == null ? Promise.resolve(null) : tx.get(ref)
+  ));
+
+  return pointerSnaps.map((pointerSnap, index) => {
+    const callSnap = callSnaps[index];
+    const callData = callSnap?.data() ?? null;
+    const callUserIds = callData?.participantUids ?? [
+      callData?.callerUid,
+      callData?.calleeUid,
+    ];
+    return {
+      pointerRef: pointerRefs[index],
+      pointerExists: pointerSnap.exists,
+      callRef: callRefs[index],
+      callData,
+      closeCall:
+        callSnap?.exists === true &&
+        callData?.matchId === matchIds[index] &&
+        isExactDirectChatParticipants(callUserIds, expectedUserIds) &&
+        (callData?.status === 'ringing' || callData?.status === 'accepted'),
+    };
+  });
+}
+
+function stageActiveCallClosures(
+  tx: FirebaseFirestore.Transaction,
+  closures: readonly ActiveCallClosureSnapshot[],
+  params: {
+    actorUid: string;
+    closedReason: SafetyClosureReason;
+    now: admin.firestore.Timestamp;
+  }
+): void {
+  for (const closure of closures) {
+    if (closure.closeCall && closure.callRef != null) {
+      const acceptedAtMillis = closure.callData?.acceptedAt?.toMillis?.();
+      tx.update(closure.callRef, {
+        status: 'ended',
+        ...(params.closedReason === 'left_chat'
+          ? { endedBy: params.actorUid }
+          : { endedBy: admin.firestore.FieldValue.delete() }),
+        endedReason: 'room_closed',
+        endedAt: params.now,
+        ...(typeof acceptedAtMillis === 'number'
+          ? {
+              durationSec: Math.max(
+                0,
+                Math.floor((params.now.toMillis() - acceptedAtMillis) / 1000)
+              ),
+            }
+          : {}),
+        updatedAt: params.now,
+      });
+    }
+    if (closure.pointerExists) tx.delete(closure.pointerRef);
+  }
+}
+
+/**
+ * Stages every exact-pair room, pair pointer, and current call closure inside
+ * the caller's existing block/report transaction. A sentinel aborts the whole
+ * safety action instead of leaving a partially hidden relationship.
+ */
+async function stageAllActivePairSafetyClosures(
+  tx: FirebaseFirestore.Transaction,
+  params: {
+    actorUid: string;
+    targetUid: string;
+    closedReason: 'blocked' | 'reported';
+  }
+): Promise<string[]> {
   const userIds = [params.actorUid, params.targetUid].sort();
   const pairKey = userIds.join('_');
-  const matchRef = db.collection('matches').doc(params.candidateMatchId);
-  const pairRef = db.collection('chatPairs').doc(pairKey);
-
-  return db.runTransaction(async (tx) => {
-    const [matchSnap, pairSnap] = await Promise.all([
-      tx.get(matchRef),
-      tx.get(pairRef),
+  const activeRoomsQuery = db.collection('matches')
+    .where('pairKey', '==', pairKey)
+    .where('isActive', '==', true)
+    .limit(MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION + 1);
+  const pairPointersQuery = db.collection('chatPairs')
+    .where('pairKey', '==', pairKey)
+    .limit(MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION + 1);
+  const canonicalPairRef = db.collection('chatPairs').doc(pairKey);
+  const [activeRoomsSnap, pairPointersSnap, canonicalPairSnap] =
+    await Promise.all([
+      tx.get(activeRoomsQuery),
+      tx.get(pairPointersQuery),
+      tx.get(canonicalPairRef),
     ]);
-    const decision = decideCloseActiveChatPolicy({
-      matchId: params.candidateMatchId!,
-      matchExists: matchSnap.exists,
-      matchActive: matchSnap.data()?.isActive === true,
-      matchUserIds: matchSnap.data()?.userIds,
-      actorUid: params.actorUid,
-      targetUid: params.targetUid,
-      pairActiveMatchId: pairSnap.data()?.activeMatchId,
-    });
 
-    if (!decision.closeMatch) return null;
+  const selectedRooms = activePairRoomIdsForSafety({
+    records: activeRoomsSnap.docs.map((doc) => ({
+      id: doc.id,
+      isActive: doc.data().isActive,
+      userIds: doc.data().userIds,
+    })),
+    actorUid: params.actorUid,
+    targetUid: params.targetUid,
+  });
+  if (
+    !selectedRooms.scanComplete ||
+    pairPointersSnap.size > MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Unable to close every active chat safely'
+    );
+  }
 
-    tx.update(matchRef, {
+  if (
+    canonicalPairSnap.exists &&
+    !isExactDirectChatParticipants(canonicalPairSnap.data()?.userIds, userIds)
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Unable to close every active chat safely'
+    );
+  }
+
+  const matchIds = selectedRooms.matchIds;
+  const matchIdSet = new Set(matchIds);
+  const callClosures = await readActiveCallClosures(tx, matchIds, userIds);
+  const now = admin.firestore.Timestamp.now();
+
+  for (const matchId of matchIds) {
+    tx.update(db.collection('matches').doc(matchId), {
       isActive: false,
-      hiddenFor: admin.firestore.FieldValue.arrayUnion(
-        ...closedChatHiddenParticipants(params.actorUid, params.targetUid)
-      ),
+      hiddenFor: userIds,
       closedBy: params.actorUid,
       closedReason: params.closedReason,
-      closedAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      closedAt: now,
+      updatedAt: now,
     });
+  }
 
-    if (decision.clearPairPointer) {
-      tx.set(
-        pairRef,
-        {
-          pairKey,
-          userIds,
-          activeMatchId: admin.firestore.FieldValue.delete(),
-          closedMatchId: params.candidateMatchId,
-          closedReason: params.closedReason,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+  const pointerSnaps = new Map<
+    string,
+    FirebaseFirestore.DocumentSnapshot
+  >(pairPointersSnap.docs.map((snap) => [snap.ref.path, snap]));
+  if (canonicalPairSnap.exists) {
+    pointerSnaps.set(canonicalPairSnap.ref.path, canonicalPairSnap);
+  }
+  for (const pointerSnap of pointerSnaps.values()) {
+    if (!isExactDirectChatParticipants(pointerSnap.data()?.userIds, userIds)) {
+      continue;
     }
+    const activeMatchId = pointerSnap.data()?.activeMatchId;
+    tx.set(pointerSnap.ref, {
+      activeMatchId: admin.firestore.FieldValue.delete(),
+      ...(typeof activeMatchId === 'string' && matchIdSet.has(activeMatchId)
+        ? {
+            closedMatchId: activeMatchId,
+            closedReason: params.closedReason,
+          }
+        : {}),
+      updatedAt: now,
+    }, { merge: true });
+  }
 
-    return params.candidateMatchId;
+  stageActiveCallClosures(tx, callClosures, {
+    actorUid: params.actorUid,
+    closedReason: params.closedReason,
+    now,
   });
+  return matchIds;
 }
 
 function reportContentDocumentRefs(
@@ -2213,7 +2744,9 @@ const allowedMessageReactions = ['❤️', '😂', '👍', '😮', '😢', '🙏
  * updateFcmToken(data: { token: string }) -> { ok: true }
  *
  * Stores the current device FCM token through a server-owned path so clients do
- * not directly write notification credentials to the public user document.
+ * not directly write notification credentials to the public user document. A
+ * first-session caller whose profile is not ready receives a retryable,
+ * minimal failed-precondition response instead of a false success.
  */
 export const updateFcmToken = regionalFunctions.https.onCall(
   async (data: any, context: functions.https.CallableContext) => {
@@ -2240,7 +2773,14 @@ export const updateFcmToken = regionalFunctions.https.onCall(
         exists: userSnap.exists,
         userData: userSnap.data(),
       });
-      if (accountIssue === 'missing') return;
+      const retryDetails = retryableFcmRegistrationDetails(accountIssue);
+      if (retryDetails != null) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Notification registration is not ready',
+          retryDetails
+        );
+      }
       if (accountIssue === 'banned') {
         throw new functions.https.HttpsError('permission-denied', 'User is banned');
       }
@@ -2810,7 +3350,7 @@ async function reserveMediaUploadForProtocol(
         : null;
       const matchSnap = matchRef == null ? null : await tx.get(matchRef);
       if (matchRef != null && (matchSnap == null || !matchSnap.exists)) {
-        throw new functions.https.HttpsError('not-found', 'Chat room not found');
+        throw directRoomUnavailable();
       }
 
       const matchData = matchSnap?.data();
@@ -2822,19 +3362,14 @@ async function reserveMediaUploadForProtocol(
           !participants.includes(uid) ||
           matchData?.directRoomVersion !== 1 ||
           matchData?.isActive !== true ||
-          (Array.isArray(matchData?.hiddenFor) && matchData.hiddenFor.length > 0)
+          !Array.isArray(matchData?.hiddenFor) ||
+          matchData.hiddenFor.length > 0
         ) {
-          throw new functions.https.HttpsError(
-            'permission-denied',
-            'Chat room is not available for media upload'
-          );
+          throw directRoomUnavailable();
         }
         otherUid = participants.find((participantUid) => participantUid !== uid) ?? null;
         if (otherUid == null) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            'Chat room participants are invalid'
-          );
+          throw directRoomUnavailable();
         }
       }
 
@@ -2904,34 +3439,28 @@ async function reserveMediaUploadForProtocol(
         exists: otherUserSnap.exists,
         userData: otherUserSnap.data(),
       }) !== null) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Chat participant is unavailable'
-        );
+        throw directRoomUnavailable();
       }
       if (callerBlockSnap?.exists || recipientBlockSnap?.exists) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Chat participants have blocked each other'
-        );
+        throw directRoomUnavailable();
       }
       if (
         request.kind === 'chat' &&
-        (uploadProtocolVersion === mediaUploadProtocolVersion
+        (matchData?.pairKey !== expectedPairKey ||
+          (uploadProtocolVersion === mediaUploadProtocolVersion
           ? pairSnap?.exists !== true ||
             pairSnap.data()?.pairKey !== expectedPairKey ||
             !isExactDirectChatParticipants(
               pairSnap.data()?.userIds,
               [uid, otherUid!]
             ) ||
-            pairSnap.data()?.activeMatchId !== request.matchId
+            pairSnap.data()?.activeMatchId !== request.matchId ||
+            pairSnap.data()?.closedMatchId !== undefined ||
+            pairSnap.data()?.closedReason !== undefined
           : pairSnap?.exists === true &&
-            pairSnap.data()?.activeMatchId !== request.matchId)
+            pairSnap.data()?.activeMatchId !== request.matchId))
       ) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Chat room is no longer the active room for this pair'
-        );
+        throw directRoomUnavailable();
       }
 
       const countField = request.kind === 'profile'
@@ -2950,11 +3479,24 @@ async function reserveMediaUploadForProtocol(
         );
       }
 
+      // Both retained V1 and V2 reservation endpoints are server-owned. While
+      // V1 remains supported during the reviewed transition, a first profile
+      // upload through either endpoint must produce the same exact one-use
+      // onboarding shell; otherwise a legacy client can create an incomplete
+      // user document that completeOnboarding can never safely recognize.
+      const isProfileUpload = request.kind === 'profile';
       if (!userSnap.exists) {
         tx.create(userRef, {
           uid,
           accountStatus: 'onboarding',
           onboardingCompleted: false,
+          // Only this source-identified shell may bootstrap onboarding points.
+          ...(isProfileUpload
+            ? {
+                onboardingShellProvenance:
+                  profileUploadOnboardingShellProvenance,
+              }
+            : {}),
           createdAt: now,
           updatedAt: now,
         });
@@ -4668,34 +5210,38 @@ export const completeOnboarding = regionalFunctions.https.onCall(
       let pointGrantDecision;
       try {
         pointGrantDecision = decideInitialOnboardingPointGrant({
+          uid,
+          userExists: userSnap.exists,
+          userData,
           initialPointEventExists: initialPointEventSnap.exists,
-          currentKeyCount: userData?.keyCount,
         });
       } catch (_) {
         throw new functions.https.HttpsError(
           'failed-precondition',
-          'Point balance is invalid'
+          'Point balance requires account review'
         );
       }
 
-      if (pointGrantDecision.action !== 'none') {
-        if (pointGrantDecision.action === 'grant') {
-          profileUpdate.keyCount = admin.firestore.FieldValue.increment(
-            pointGrantDecision.amount
-          );
-        }
-        tx.set(initialPointEventRef, {
+      if (
+        userData?.onboardingShellProvenance ===
+        profileUploadOnboardingShellProvenance
+      ) {
+        profileUpdate.onboardingShellProvenance =
+          admin.firestore.FieldValue.delete();
+      }
+
+      if (pointGrantDecision.action === 'grant') {
+        profileUpdate.keyCount = pointGrantDecision.balanceAfter;
+        profileUpdate.pointBalanceTrustVersion = pointBalanceTrustVersion;
+        tx.create(initialPointEventRef, {
           uid,
           eventType: 'grant',
           amount: pointGrantDecision.amount,
-          reason:
-            pointGrantDecision.action === 'grant'
-              ? 'Initial onboarding point grant'
-              : 'Legacy onboarding balance migration marker',
+          reason: 'Initial onboarding point grant',
           balanceBefore: pointGrantDecision.balanceBefore,
           balanceAfter: pointGrantDecision.balanceAfter,
           source: pointGrantDecision.source,
-          migrationMarker: pointGrantDecision.action === 'write-marker',
+          migrationMarker: false,
           legacyBalancePreserved: pointGrantDecision.legacyBalancePreserved,
           timestamp: now,
         } as QuotaEventData);
@@ -6847,38 +7393,29 @@ export const sendMessage = regionalFunctions.https.onCall(
       const matchData = matchSnap.data()!;
       const userIds = matchData.userIds as string[] | undefined;
       if (!isExactDirectChatParticipants(userIds) || !userIds.includes(uid)) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'User not in this match'
-        );
+        throw directRoomUnavailable();
       }
 
       if (matchData.isActive !== true) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Match is not active'
-        );
+        throw directRoomUnavailable();
       }
 
       const hiddenFor = matchData.hiddenFor as string[] | undefined;
-      if (Array.isArray(hiddenFor) && hiddenFor.includes(uid)) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Match is not active'
-        );
+      if (!Array.isArray(hiddenFor) || hiddenFor.length > 0) {
+        throw directRoomUnavailable();
       }
 
       const otherUid = userIds.find((id) => id !== uid);
       if (!otherUid) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'Invalid match participants'
-        );
+        throw directRoomUnavailable();
       }
 
       const otherUserRef = db.collection('users').doc(otherUid);
       const callerBlockRef = db.collection('users').doc(uid).collection('blocks').doc(otherUid);
       const recipientBlockRef = db.collection('users').doc(otherUid).collection('blocks').doc(uid);
+      const expectedUserIds = [uid, otherUid].sort();
+      const pairKey = expectedUserIds.join('_');
+      const pairRef = db.collection('chatPairs').doc(pairKey);
       const replyToMessageId = typeof data.replyToMessageId === 'string'
         ? data.replyToMessageId.trim()
         : '';
@@ -6886,12 +7423,20 @@ export const sendMessage = regionalFunctions.https.onCall(
         ? matchRef.collection('messages').doc(replyToMessageId)
         : null;
       const callerUserRef = db.collection('users').doc(uid);
-      const [callerUserSnap, otherUserSnap, callerBlockSnap, recipientBlockSnap, replyMessageSnap] = await Promise.all([
+      const [
+        callerUserSnap,
+        otherUserSnap,
+        callerBlockSnap,
+        recipientBlockSnap,
+        replyMessageSnap,
+        pairSnap,
+      ] = await Promise.all([
         tx.get(callerUserRef),
         tx.get(otherUserRef),
         tx.get(callerBlockRef),
         tx.get(recipientBlockRef),
         replyMessageRef == null ? Promise.resolve(null) : tx.get(replyMessageRef),
+        tx.get(pairRef),
       ]);
 
       if (activeAccountIssue({
@@ -6910,17 +7455,21 @@ export const sendMessage = regionalFunctions.https.onCall(
           userData: otherUserSnap.data(),
         }) !== null
       ) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Recipient is unavailable'
-        );
+        throw directRoomUnavailable();
       }
 
       if (callerBlockSnap.exists || recipientBlockSnap.exists) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'One or both users have blocked each other'
-        );
+        throw directRoomUnavailable();
+      }
+
+      if (!reusableDirectRoomSnapshots({
+        matchId,
+        matchSnap,
+        pairSnap,
+        expectedUserIds,
+        pairKey,
+      })) {
+        throw directRoomUnavailable();
       }
 
       if (replyMessageRef != null) {
@@ -7067,38 +7616,52 @@ export const retryMessageTranslation = regionalFunctions.https.onCall(
     const matchData = matchSnap.data()!;
     if (!isExactDirectChatParticipants(matchData.userIds) ||
       !matchData.userIds.includes(uid)) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'User not in this match'
-      );
+      throw directRoomUnavailable();
     }
 
-    if (matchData.isActive !== true) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'Match is not active'
-      );
+    if (
+      matchData.isActive !== true ||
+      !Array.isArray(matchData.hiddenFor) ||
+      matchData.hiddenFor.length > 0
+    ) {
+      throw directRoomUnavailable();
     }
 
     const otherUid = (matchData.userIds as string[]).find((id) => id !== uid);
     if (!otherUid) {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'Invalid match participants'
-      );
+      throw directRoomUnavailable();
     }
 
-    const [callerBlockedOther, otherBlockedCaller, otherUserSnap] = await Promise.all([
+    const expectedUserIds = [uid, otherUid].sort();
+    const pairKey = expectedUserIds.join('_');
+    const [
+      callerBlockedOther,
+      otherBlockedCaller,
+      otherUserSnap,
+      pairSnap,
+    ] = await Promise.all([
       db.collection('users').doc(uid).collection('blocks').doc(otherUid).get(),
       db.collection('users').doc(otherUid).collection('blocks').doc(uid).get(),
       db.collection('users').doc(otherUid).get(),
+      db.collection('chatPairs').doc(pairKey).get(),
     ]);
 
-    if (callerBlockedOther.exists || otherBlockedCaller.exists) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'One or both users have blocked each other'
-      );
+    if (
+      activeAccountIssue({
+        exists: otherUserSnap.exists,
+        userData: otherUserSnap.data(),
+      }) !== null ||
+      callerBlockedOther.exists ||
+      otherBlockedCaller.exists ||
+      !reusableDirectRoomSnapshots({
+        matchId,
+        matchSnap,
+        pairSnap,
+        expectedUserIds,
+        pairKey,
+      })
+    ) {
+      throw directRoomUnavailable();
     }
 
     const messageData = messageSnap.data()!;
@@ -7215,7 +7778,7 @@ export const setMessageReaction = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('not-found', 'Message not found');
       }
       const matchData = matchSnap.data()!;
-      await assertActiveDirectRoomMutation(tx, uid, matchData);
+      await assertActiveDirectRoomMutation(tx, uid, matchId, matchData);
 
       tx.update(messageRef, {
         [`reactions.${uid}`]: emoji.length > 0
@@ -7278,6 +7841,12 @@ export const leaveChat = regionalFunctions.https.onCall(
       const pairKey = sortedUserIds.join('_');
       const pairRef = db.collection('chatPairs').doc(pairKey);
       const pairSnap = await tx.get(pairRef);
+      const callClosures = await readActiveCallClosures(
+        tx,
+        [matchId],
+        sortedUserIds
+      );
+      const now = admin.firestore.Timestamp.now();
       const decision = decideCloseActiveChatPolicy({
         matchId,
         matchExists: true,
@@ -7290,15 +7859,22 @@ export const leaveChat = regionalFunctions.https.onCall(
 
       // A repeated leave for a historical room is idempotent and must never
       // clear a concurrently-created replacement room's pair pointer.
-      if (!decision.closeMatch) return false;
+      if (!decision.closeMatch) {
+        stageActiveCallClosures(tx, callClosures, {
+          actorUid: uid,
+          closedReason: 'left_chat',
+          now,
+        });
+        return false;
+      }
 
       tx.update(matchRef, {
         isActive: false,
         hiddenFor: admin.firestore.FieldValue.arrayUnion(...userIds),
         closedBy: uid,
         closedReason: 'left_chat',
-        closedAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        closedAt: now,
+        updatedAt: now,
       });
 
       if (decision.clearPairPointer) {
@@ -7310,11 +7886,16 @@ export const leaveChat = regionalFunctions.https.onCall(
             activeMatchId: admin.firestore.FieldValue.delete(),
             closedMatchId: matchId,
             closedReason: 'left_chat',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: now,
           },
           { merge: true }
         );
       }
+      stageActiveCallClosures(tx, callClosures, {
+        actorUid: uid,
+        closedReason: 'left_chat',
+        now,
+      });
       return true;
     });
 
@@ -7354,7 +7935,7 @@ export const setChatFavorite = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('not-found', 'Match not found');
       }
       const matchData = matchSnap.data()!;
-      await assertActiveDirectRoomMutation(tx, uid, matchData);
+      await assertActiveDirectRoomMutation(tx, uid, matchId, matchData);
       tx.update(matchRef, {
         [`favoriteFor.${uid}`]: favorite,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -7394,7 +7975,7 @@ export const markChatRead = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('not-found', 'Match not found');
       }
       const matchData = matchSnap.data()!;
-      await assertActiveDirectRoomMutation(tx, uid, matchData);
+      await assertActiveDirectRoomMutation(tx, uid, matchId, matchData);
       tx.update(matchRef, {
         [`unread.${uid}`]: 0,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -7497,11 +8078,13 @@ export const createLoungePost = regionalFunctions.https.onCall(
       const freshPhotoUrls = Array.isArray(freshUserData.photoUrls)
         ? freshUserData.photoUrls
         : [];
-      const currentKeyCount = (freshUserData.keyCount as number) ?? 0;
       const shouldGrant = shouldGrantDailyLoungePostPoints(
         freshUserData.lastLoungePostPointGrantDate,
         todayKey
       );
+      const currentKeyCount = shouldGrant
+        ? pointBalanceForServerGrant(freshUserData)
+        : requireTrustedPointBalance(freshUserData);
       const nextKeyCount = shouldGrant
         ? pointBalanceAfterGrant(currentKeyCount, dailyLoungePostPointGrantAmount)
         : currentKeyCount;
@@ -7524,9 +8107,8 @@ export const createLoungePost = regionalFunctions.https.onCall(
       if (shouldGrant) {
         const pointEventRef = db.collection('pointEvents').doc();
         tx.update(userRef, {
-          keyCount: admin.firestore.FieldValue.increment(
-            dailyLoungePostPointGrantAmount
-          ),
+          keyCount: nextKeyCount,
+          pointBalanceTrustVersion,
           lastLoungePostPointGrantDate: todayKey,
           lastLoungePostPointGrantAt: admin.firestore.FieldValue.serverTimestamp(),
         });
@@ -8021,13 +8603,18 @@ export const blockUser = regionalFunctions.https.onCall(
     const callerRef = db.collection('users').doc(uid);
     const targetRef = db.collection('users').doc(targetUid);
 
-    await db.runTransaction(async (tx) => {
+    const closedMatchIds = await db.runTransaction(async (tx) => {
       const [callerSnap, freshTargetSnap] = await Promise.all([
         tx.get(callerRef),
         tx.get(targetRef),
       ]);
       assertActiveAccountSnapshot(callerSnap);
       const targetData = assertActiveAccountSnapshot(freshTargetSnap, 'Target user');
+      const closedIds = await stageAllActivePairSafetyClosures(tx, {
+        actorUid: uid,
+        targetUid,
+        closedReason: 'blocked',
+      });
       tx.set(blockRef, {
         blockedAt: now,
         reason,
@@ -8042,19 +8629,11 @@ export const blockUser = regionalFunctions.https.onCall(
         seenAt: now,
         reason: 'block',
       });
+      return closedIds;
     });
 
-    // Resolve the current active room, then atomically close it with its pair
-    // pointer. A replacement pointer created concurrently is never cleared.
-    const matchId = await findMatch(uid, targetUid);
-    const closedMatchId = await closePairChatForSafety({
-      actorUid: uid,
-      targetUid,
-      candidateMatchId: matchId,
-      closedReason: 'blocked',
-    });
-    if (closedMatchId) {
-      await notifyChatRemoved(targetUid, closedMatchId);
+    if (closedMatchIds.length > 0) {
+      await notifyChatRemoved(targetUid, closedMatchIds[0]);
     }
 
     return { ok: true };
@@ -8206,7 +8785,7 @@ export const reportUser = regionalFunctions.https.onCall(
     const reporterRef = db.collection('users').doc(uid);
     const contentRefs = reportContentDocumentRefs(contentContext);
 
-    await db.runTransaction(async (transaction) => {
+    const closedMatchIds = await db.runTransaction(async (transaction) => {
       const [reporterSnap, targetSnap, ...contentSnaps] = await Promise.all([
         transaction.get(reporterRef),
         transaction.get(targetRef),
@@ -8221,6 +8800,11 @@ export const reportUser = regionalFunctions.https.onCall(
             targetUid,
           })
         : null;
+      const closedIds = await stageAllActivePairSafetyClosures(transaction, {
+        actorUid: uid,
+        targetUid,
+        closedReason: 'reported',
+      });
 
       transaction.set(reportRef, {
         reportId,
@@ -8252,37 +8836,11 @@ export const reportUser = regionalFunctions.https.onCall(
         seenAt: now,
         reason: 'report',
       });
+      return closedIds;
     });
 
-    let activeMatchId: string | null = null;
-    if (requestedMatchId) {
-      const requestedMatchSnap = await db.collection('matches').doc(requestedMatchId).get();
-      const requestedUserIds = requestedMatchSnap.data()?.userIds as string[] | undefined;
-      if (
-        canUseRequestedMatchForSafety({
-          exists: requestedMatchSnap.exists,
-          isActive: requestedMatchSnap.data()?.isActive === true,
-          userIds: requestedUserIds,
-          actorUid: uid,
-          targetUid,
-        })
-      ) {
-        activeMatchId = requestedMatchId;
-      }
-    }
-
-    if (!activeMatchId) {
-      activeMatchId = await findMatch(uid, targetUid);
-    }
-
-    const closedMatchId = await closePairChatForSafety({
-      actorUid: uid,
-      targetUid,
-      candidateMatchId: activeMatchId,
-      closedReason: 'reported',
-    });
-    if (closedMatchId) {
-      await notifyChatRemoved(targetUid, closedMatchId);
+    if (closedMatchIds.length > 0) {
+      await notifyChatRemoved(targetUid, closedMatchIds[0]);
     }
 
     return {
@@ -8315,36 +8873,23 @@ export const onMessageCreated = regionalFunctions.firestore
       const matchSnap = await db.collection('matches').doc(matchId).get();
       if (matchSnap.exists) {
         const matchData = matchSnap.data()!;
-        const recipientUid: string = (matchData.userIds as string[]).find(
+        if (
+          !isExactDirectChatParticipants(matchData.userIds) ||
+          !matchData.userIds.includes(senderUid)
+        ) return;
+        const recipientUid: string = matchData.userIds.find(
           (id) => id !== senderUid
         ) ?? '';
 
         if (recipientUid) {
-          const [senderBlockedRecipient, recipientBlockedSender] = await Promise.all([
-            db.collection('users').doc(senderUid).collection('blocks').doc(recipientUid).get(),
-            db.collection('users').doc(recipientUid).collection('blocks').doc(senderUid).get(),
-          ]);
-
-          // Load profiles before translation and notification side effects.
-          const [recipientSnap, senderSnap] = await Promise.all([
-            db.collection('users').doc(recipientUid).get(),
-            db.collection('users').doc(senderUid).get(),
-          ]);
-          const recipientData = recipientSnap.data();
-          const senderData = senderSnap.data();
-
-          if (!canApplyMessageSideEffects({
-            matchActive: matchData.isActive === true,
-            senderBlockedRecipient: senderBlockedRecipient.exists,
-            recipientBlockedSender: recipientBlockedSender.exists,
-            recipientExists: recipientSnap.exists,
-            recipientBanned: activeAccountIssue({
-              exists: recipientSnap.exists,
-              userData: recipientData,
-            }) !== null,
-          })) {
-            return;
-          }
+          const initialAccess =
+            await readAuthorizedDirectRoomSideEffectContext({
+              matchId,
+              senderUid,
+              recipientUid,
+            });
+          if (initialAccess == null) return;
+          const { recipientData, senderData } = initialAccess;
 
           let resolvedOriginalLang: 'ko' | 'ja' | 'unknown' = 'unknown';
           let resolvedTranslations: Record<string, string | null> = {
@@ -8426,21 +8971,32 @@ export const onMessageCreated = regionalFunctions.firestore
               maxLength: 50,
             });
 
-          // Increment unread and persist a recipient-specific translated
-          // preview without replacing the immutable original preview.
-          await db.collection('matches').doc(matchId).update({
-            [`unread.${recipientUid}`]: admin.firestore.FieldValue.increment(1),
-            ...(localizedPreview == null
-              ? {}
-              : { [`lastMessagePreviewFor.${recipientUid}`]: localizedPreview }),
+          // Reauthorize inside the same transaction as the unread mutation so
+          // a concurrent block/closure cannot leave a recipient side effect.
+          const unreadAccess = await applyAuthorizedMessageRecipientState({
+            matchId,
+            senderUid,
+            recipientUid,
+            localizedPreview,
           });
+          if (unreadAccess == null) return;
 
-          // Use recipient profile for FCM token + settings
-          const fcmToken: string | null = recipientData?.fcmToken ?? null;
+          // Re-read once more immediately before push delivery. Translation or
+          // unread work can race with a block, ban, room closure, or pointer
+          // replacement, and a stale token must not receive the notification.
+          const pushAccess = await readAuthorizedDirectRoomSideEffectContext({
+            matchId,
+            senderUid,
+            recipientUid,
+          });
+          if (pushAccess == null) return;
+          const pushRecipientData = pushAccess.recipientData;
+          const pushSenderData = pushAccess.senderData;
+          const fcmToken: string | null = pushRecipientData.fcmToken ?? null;
           const notificationsEnabled: boolean =
-            recipientData?.notificationsEnabled ?? true;
+            pushRecipientData.notificationsEnabled ?? true;
           const nightQuietEnabled: boolean =
-            recipientData?.nightQuietEnabled ?? false;
+            pushRecipientData.nightQuietEnabled ?? false;
           const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
           const hourKst = nowKst.getUTCHours();
 
@@ -8451,7 +9007,7 @@ export const onMessageCreated = regionalFunctions.firestore
             hourKst,
           }) && fcmToken) {
             const senderName: string =
-              senderData?.displayName ?? '하나';
+              pushSenderData.displayName ?? '하나';
             const preview = isStickerMessage
               ? 'Sticker'
               : isImageMessage
@@ -8460,7 +9016,7 @@ export const onMessageCreated = regionalFunctions.firestore
                   originalText: messageData.originalText,
                   originalLang: resolvedOriginalLang,
                   translations: resolvedTranslations,
-                  recipientProfile: recipientData,
+                  recipientProfile: pushRecipientData,
                   maxLength: 60,
                 }) ?? '';
 
@@ -8535,17 +9091,13 @@ export const onUserBlocked = regionalFunctions.firestore
   .onCreate(async (_snap, context) => {
     const { uid, targetUid } = context.params;
 
-    try {
-      const matchId = await findMatch(uid, targetUid);
-      await closePairChatForSafety({
+    await db.runTransaction(async (tx) => {
+      await stageAllActivePairSafetyClosures(tx, {
         actorUid: uid,
         targetUid,
-        candidateMatchId: matchId,
         closedReason: 'blocked',
       });
-    } catch (error) {
-      console.error('onUserBlocked error:', error);
-    }
+    });
   });
 
 /**
@@ -8624,6 +9176,147 @@ export const onPostLikeDeleted = regionalFunctions.firestore
  * then recompute the rated user's avgRating aggregate.
  */
 /**
+ * listActiveChats(data: { limit?: number, cursor?: string })
+ * -> { rooms: SanitizedActiveChat[], nextCursor: string | null }
+ *
+ * Firestore cannot prove bilateral block and peer-account lookups for a
+ * collection query. Keep direct list reads closed and return only rooms that
+ * pass the full current-pointer contract in one bounded server transaction.
+ */
+export const listActiveChats = regionalFunctions.https.onCall(
+  async (data: any, context: functions.https.CallableContext) => {
+    const uid = await requireAuthAndNotBanned(context);
+    const requestedLimit = data?.limit ?? 20;
+    const cursor = data?.cursor ?? null;
+    if (
+      !Number.isSafeInteger(requestedLimit) ||
+      requestedLimit < 1 ||
+      requestedLimit > 20
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'limit must be an integer from 1 to 20'
+      );
+    }
+    if (
+      cursor !== null &&
+      (typeof cursor !== 'string' ||
+        cursor.length === 0 ||
+        cursor.length > 128 ||
+        cursor.includes('/'))
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'cursor must be a valid room id'
+      );
+    }
+
+    const result = await db.runTransaction(async (tx) => {
+      let roomsQuery: FirebaseFirestore.Query = db.collection('matches')
+        .where('userIds', 'array-contains', uid)
+        .where('isActive', '==', true)
+        .where('directRoomVersion', '==', 1)
+        .orderBy(admin.firestore.FieldPath.documentId())
+        .limit(requestedLimit + 1);
+      if (cursor !== null) roomsQuery = roomsQuery.startAfter(cursor);
+
+      const [candidateSnap, callerSnap] = await Promise.all([
+        tx.get(roomsQuery),
+        tx.get(db.collection('users').doc(uid)),
+      ]);
+      assertActiveAccountSnapshot(callerSnap);
+      const pageDocs = candidateSnap.docs.slice(0, requestedLimit);
+      const rooms = (await Promise.all(pageDocs.map(async (roomSnap) => {
+        const room = roomSnap.data();
+        if (
+          !isExactDirectChatParticipants(room.userIds) ||
+          !room.userIds.includes(uid) ||
+          !Array.isArray(room.hiddenFor) ||
+          room.hiddenFor.length !== 0
+        ) return null;
+        const otherUid = room.userIds.find((participantUid) =>
+          participantUid !== uid
+        );
+        if (otherUid == null) return null;
+        const expectedUserIds = [uid, otherUid].sort();
+        const pairKey = expectedUserIds.join('_');
+        if (room.pairKey !== pairKey) return null;
+
+        const peerRef = db.collection('users').doc(otherUid);
+        const [pairSnap, peerSnap, callerBlockSnap, peerBlockSnap] =
+          await Promise.all([
+            tx.get(db.collection('chatPairs').doc(pairKey)),
+            tx.get(peerRef),
+            tx.get(db.collection('users').doc(uid).collection('blocks').doc(otherUid)),
+            tx.get(peerRef.collection('blocks').doc(uid)),
+          ]);
+        if (
+          activeAccountIssue({
+            exists: peerSnap.exists,
+            userData: peerSnap.data(),
+          }) !== null ||
+          callerBlockSnap.exists ||
+          peerBlockSnap.exists ||
+          !reusableDirectRoomSnapshots({
+            matchId: roomSnap.id,
+            matchSnap: roomSnap,
+            pairSnap,
+            expectedUserIds,
+            pairKey,
+          })
+        ) return null;
+
+        const peer = peerSnap.data()!;
+        const createdAtMillis = room.createdAt?.toMillis?.();
+        const lastMessageAtMillis = room.lastMessageAt?.toMillis?.();
+        const unreadCount = room.unread?.[uid];
+        const favorite = room.favoriteFor?.[uid];
+        const localizedPreview = room.lastMessagePreviewFor?.[uid];
+        return {
+          matchId: roomSnap.id,
+          userIds: expectedUserIds,
+          createdAtMillis: typeof createdAtMillis === 'number'
+            ? createdAtMillis
+            : null,
+          lastMessageAtMillis: typeof lastMessageAtMillis === 'number'
+            ? lastMessageAtMillis
+            : null,
+          lastMessagePreview: typeof localizedPreview === 'string'
+            ? localizedPreview
+            : typeof room.lastMessagePreview === 'string'
+              ? room.lastMessagePreview
+              : null,
+          unreadCount: Number.isSafeInteger(unreadCount) && unreadCount >= 0
+            ? unreadCount
+            : 0,
+          favorite: favorite === true,
+          partner: {
+            uid: otherUid,
+            displayName: typeof peer.displayName === 'string'
+              ? peer.displayName
+              : '',
+            photoUrl: firstPhoto(peer),
+            nationality: typeof peer.nationality === 'string'
+              ? peer.nationality
+              : '',
+            gender: typeof peer.gender === 'string' ? peer.gender : '',
+          },
+        };
+      }))).filter((room): room is NonNullable<typeof room> => room != null);
+
+      return {
+        rooms,
+        nextCursor: candidateSnap.size > requestedLimit && pageDocs.length > 0
+          ? pageDocs[pageDocs.length - 1].id
+          : null,
+      };
+    });
+
+    return result;
+  }
+);
+
+/**
  * startChat(data: { targetUid: string }) -> { matchId, pointBalance, keyCount, alreadyExists }
  *
  * Creates or reuses a direct 1:1 chat room.
@@ -8645,7 +9338,6 @@ export const startChat = regionalFunctions.https.onCall(
     const ids = [uid, targetUid].sort();
     const pairKey = ids.join('_');
     const pairRef = db.collection('chatPairs').doc(pairKey);
-    const legacyMatchRef = db.collection('matches').doc(pairKey);
     const userRef = db.collection('users').doc(uid);
     const targetRef = db.collection('users').doc(targetUid);
     const callerBlockRef = db.collection('users').doc(uid).collection('blocks').doc(targetUid);
@@ -8653,18 +9345,16 @@ export const startChat = regionalFunctions.https.onCall(
 
     const [
       targetSnap,
-      mySnap,
       callerBlockedTarget,
       targetBlockedCaller,
     ] = await Promise.all([
       targetRef.get(),
-      userRef.get(),
       callerBlockRef.get(),
       targetBlockRef.get(),
     ]);
 
     if (!targetSnap.exists) {
-      throw new functions.https.HttpsError('not-found', 'Target user profile not found');
+      throw directChatTargetUnavailable();
     }
 
     const targetData = targetSnap.data() ?? {};
@@ -8676,50 +9366,31 @@ export const startChat = regionalFunctions.https.onCall(
       !isEligibleExternalProfileViewer(targetData) ||
       !isPublicUserProfile(targetData)
     ) {
-      throw new functions.https.HttpsError('permission-denied', 'Target user is unavailable');
+      throw directChatTargetUnavailable();
     }
 
     if (callerBlockedTarget.exists || targetBlockedCaller.exists) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'One or both users have blocked each other'
-      );
+      throw directChatTargetUnavailable();
     }
 
-    const myData = mySnap.data() ?? {};
     const getPhoto = (d: any) =>
       Array.isArray(d.photoUrls) && d.photoUrls.length > 0 ? d.photoUrls[0] : '';
-
-    const isValidActiveMatch = (
-      snap: FirebaseFirestore.DocumentSnapshot
-    ): boolean => {
-      const data = snap.data();
-      const userIds = data?.userIds as string[] | undefined;
-      return (
-        snap.exists &&
-        data?.isActive === true &&
-        isExactDirectChatParticipants(userIds, ids)
-      );
-    };
 
     // Transaction: re-check active room, point check + deduction, then create a new room.
     const chatResult = await db.runTransaction(async (tx) => {
       const [
         freshPair,
-        freshLegacyMatch,
         freshUser,
         freshTarget,
         freshCallerBlock,
         freshTargetBlock,
       ] = await Promise.all([
         tx.get(pairRef),
-        tx.get(legacyMatchRef),
         tx.get(userRef),
         tx.get(targetRef),
         tx.get(callerBlockRef),
         tx.get(targetBlockRef),
       ]);
-      const currentPoints = (freshUser.data()?.keyCount as number) ?? 0;
 
       if (activeAccountIssue({
         exists: freshUser.exists,
@@ -8732,11 +9403,12 @@ export const startChat = regionalFunctions.https.onCall(
       }
 
       if (!freshTarget.exists) {
-        throw new functions.https.HttpsError('not-found', 'Target user profile not found');
+        throw directChatTargetUnavailable();
       }
 
       const freshTargetData = freshTarget.data() ?? {};
       const freshUserData = freshUser.data() ?? {};
+      const currentPoints = requireTrustedPointBalance(freshUserData);
       if (!isEligibleExternalProfileViewer(freshUserData)) {
         throw new functions.https.HttpsError(
           'failed-precondition',
@@ -8751,23 +9423,25 @@ export const startChat = regionalFunctions.https.onCall(
         !isEligibleExternalProfileViewer(freshTargetData) ||
         !isPublicUserProfile(freshTargetData)
       ) {
-        throw new functions.https.HttpsError('permission-denied', 'Target user is unavailable');
+        throw directChatTargetUnavailable();
       }
 
       if (freshCallerBlock.exists || freshTargetBlock.exists) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'One or both users have blocked each other'
-        );
+        throw directChatTargetUnavailable();
       }
 
       const activeMatchId = freshPair.data()?.activeMatchId;
-      let activeMatchRef: FirebaseFirestore.DocumentReference | null = null;
       let activePairMatchValid = false;
       if (typeof activeMatchId === 'string' && activeMatchId.length > 0) {
-        activeMatchRef = db.collection('matches').doc(activeMatchId);
+        const activeMatchRef = db.collection('matches').doc(activeMatchId);
         const activeMatchSnap = await tx.get(activeMatchRef);
-        activePairMatchValid = isValidActiveMatch(activeMatchSnap);
+        activePairMatchValid = reusableDirectRoomSnapshots({
+          matchId: activeMatchId,
+          matchSnap: activeMatchSnap,
+          pairSnap: freshPair,
+          expectedUserIds: ids,
+          pairKey,
+        });
       }
 
       const decision = decideStartChatPolicy({
@@ -8775,46 +9449,9 @@ export const startChat = regionalFunctions.https.onCall(
         activePairMatchId:
           typeof activeMatchId === 'string' ? activeMatchId : undefined,
         activePairMatchValid,
-        legacyMatchId: pairKey,
-        legacyMatchValid: isValidActiveMatch(freshLegacyMatch),
       });
 
       if (decision.action === 'reuse' && decision.source === 'pair') {
-        tx.update(activeMatchRef!, {
-          directRoomVersion: 1,
-          hiddenFor: [],
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        tx.set(pairRef, {
-          pairKey,
-          userIds: ids,
-          activeMatchId: decision.matchId,
-          closedMatchId: admin.firestore.FieldValue.delete(),
-          closedReason: admin.firestore.FieldValue.delete(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-        return {
-          matchId: decision.matchId,
-          pointBalance: decision.pointBalance,
-          alreadyExists: decision.alreadyExists,
-          createdNew: false,
-        };
-      }
-
-      if (decision.action === 'reuse' && decision.source === 'legacy') {
-        tx.update(legacyMatchRef, {
-          directRoomVersion: 1,
-          hiddenFor: [],
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        tx.set(pairRef, {
-          pairKey,
-          userIds: ids,
-          activeMatchId: pairKey,
-          closedMatchId: admin.firestore.FieldValue.delete(),
-          closedReason: admin.firestore.FieldValue.delete(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
         return {
           matchId: decision.matchId,
           pointBalance: decision.pointBalance,
@@ -8827,8 +9464,9 @@ export const startChat = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('resource-exhausted', '포인트가 부족합니다');
       }
 
+      const nextPointBalance = pointBalanceAfterConsume(currentPoints, 1);
       tx.update(userRef, {
-        keyCount: admin.firestore.FieldValue.increment(-1),
+        keyCount: nextPointBalance,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -8879,7 +9517,7 @@ export const startChat = regionalFunctions.https.onCall(
         amount: 1,
         reason: 'new_direct_chat',
         balanceBefore: currentPoints,
-        balanceAfter: pointBalanceAfterConsume(currentPoints, 1),
+        balanceAfter: nextPointBalance,
         matchId,
         pairKey,
         source: 'startChat',
@@ -8897,8 +9535,8 @@ export const startChat = regionalFunctions.https.onCall(
 
     if (chatResult.createdNew) {
       await notifyNewDirectChat({
-        starterName: myData.displayName ?? 'Hana',
         matchId: chatResult.matchId,
+        senderUid: uid,
         recipientUid: targetUid,
       });
     }
@@ -8914,7 +9552,7 @@ export const startChat = regionalFunctions.https.onCall(
 
 /**
  * startCall(data: { matchId: string, type: 'voice' | 'video' })
- * -> { callId, roomName, token, rtcUid, agoraAppId, paidUntilAt, freeSegment }
+ * -> { callId, roomName, agoraAppId, paidUntilAt, freeSegment }
  *
  * Voice policy: one free 5-minute voice call per caller per KST/JST day,
  * then 1 point per 10-minute extension/segment.
@@ -8933,7 +9571,9 @@ export const startCall = regionalFunctions.https.onCall(
       throw new functions.https.HttpsError('invalid-argument', 'matchId required');
     }
 
-    const { appId, appCertificate } = agoraConfig();
+    // Validate server configuration before creating a ringing call, but do not
+    // issue any RTC privilege until acceptCall establishes a paid segment.
+    const { appId } = agoraConfig();
     const matchRef = db.collection('matches').doc(matchId);
     const activeCallRef = db.collection('activeCalls').doc(matchId);
     const userRef = db.collection('users').doc(uid);
@@ -8951,35 +9591,37 @@ export const startCall = regionalFunctions.https.onCall(
         tx.get(activeCallRef),
       ]);
 
-      if (!matchSnap.exists) {
-        throw new functions.https.HttpsError('not-found', 'Chat room not found');
-      }
       const matchData = matchSnap.data() ?? {};
       const userIds = matchData.userIds as string[] | undefined;
       if (
+        !matchSnap.exists ||
         matchData.isActive !== true ||
         !isExactDirectChatParticipants(userIds) ||
-        !userIds.includes(uid)
+        !userIds.includes(uid) ||
+        matchData.directRoomVersion !== 1 ||
+        !Array.isArray(matchData.hiddenFor) ||
+        matchData.hiddenFor.length !== 0
       ) {
-        throw new functions.https.HttpsError('permission-denied', 'Call is not allowed in this room');
-      }
-      if (Array.isArray(matchData.hiddenFor) && matchData.hiddenFor.includes(uid)) {
-        throw new functions.https.HttpsError('permission-denied', 'Call is not allowed in hidden room');
+        throw callUnavailableError();
       }
 
       if (activeAccountIssue({
         exists: userSnap.exists,
         userData: userSnap.data(),
       }) !== null) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'Caller account is unavailable'
-        );
+        throw callUnavailableError();
       }
 
       const targetUid = userIds.find((id) => id !== uid)!;
-      const [targetSnap, callerBlockSnap, targetBlockSnap] = await Promise.all([
+      const pairKey = [...userIds].sort().join('_');
+      const [
+        targetSnap,
+        pairSnap,
+        callerBlockSnap,
+        targetBlockSnap,
+      ] = await Promise.all([
         tx.get(db.collection('users').doc(targetUid)),
+        tx.get(db.collection('chatPairs').doc(pairKey)),
         tx.get(db.collection('users').doc(uid).collection('blocks').doc(targetUid)),
         tx.get(db.collection('users').doc(targetUid).collection('blocks').doc(uid)),
       ]);
@@ -8989,24 +9631,78 @@ export const startCall = regionalFunctions.https.onCall(
           userData: targetSnap.data(),
         }) !== null
       ) {
-        throw new functions.https.HttpsError('permission-denied', 'Target user is unavailable');
+        throw callUnavailableError();
       }
-      if (callerBlockSnap.exists || targetBlockSnap.exists) {
-        throw new functions.https.HttpsError('permission-denied', 'One or both users have blocked each other');
+      if (
+        !reusableDirectRoomSnapshots({
+          matchId,
+          matchSnap,
+          pairSnap,
+          expectedUserIds: userIds,
+          pairKey,
+        }) ||
+        callerBlockSnap.exists ||
+        targetBlockSnap.exists
+      ) {
+        throw callUnavailableError();
       }
 
-      if (activeCallSnap.exists) {
-        const activeCallId = activeCallSnap.data()?.callId;
-        if (typeof activeCallId === 'string' && activeCallId.length > 0) {
-          const activeCallSnap = await tx.get(db.collection('calls').doc(activeCallId));
-          const activeStatus = activeCallSnap.data()?.status;
-          if (activeStatus === 'ringing' || activeStatus === 'accepted') {
-            throw new functions.https.HttpsError('failed-precondition', 'A call is already active');
-          }
-        }
+      const priorActiveCallId = activeCallSnap.data()?.callId;
+      const priorCallSnap =
+        typeof priorActiveCallId === 'string' &&
+        priorActiveCallId.length > 0
+          ? await tx.get(db.collection('calls').doc(priorActiveCallId))
+          : null;
+      const priorCallData = priorCallSnap?.data() ?? {};
+      const activeCallData = activeCallSnap.data() ?? {};
+      const now = admin.firestore.Timestamp.now();
+      const replacement = decideActiveCallReplacement({
+        pointerExists: activeCallSnap.exists,
+        callExists: priorCallSnap?.exists === true,
+        callBelongsToRoom:
+          priorCallData.callId === priorActiveCallId &&
+          priorCallData.matchId === matchId &&
+          isExactDirectChatParticipants(
+            priorCallData.participantUids,
+            userIds
+          ) &&
+          activeCallData.matchId === matchId &&
+          isExactDirectChatParticipants(
+            activeCallData.participantUids,
+            userIds
+          ) &&
+          activeCallData.status === priorCallData.status,
+        status: priorCallData.status,
+        ringingExpiresAtMillis:
+          priorCallData.ringingExpiresAt?.toMillis?.() ?? null,
+        paidUntilAtMillis: priorCallData.paidUntilAt?.toMillis?.() ?? null,
+        nowMillis: now.toMillis(),
+      });
+      if (replacement === 'busy') throw callClosedError();
+
+      const ringingExpiresAt = admin.firestore.Timestamp.fromMillis(
+        now.toMillis() + callRingingTtlSeconds * 1000
+      );
+      if (replacement === 'close-stale-ringing' && priorCallSnap != null) {
+        tx.update(priorCallSnap.ref, {
+          status: 'missed',
+          endedAt: now,
+          endedReason: 'ringing_expired',
+          updatedAt: now,
+        });
+      } else if (
+        replacement === 'close-expired-accepted' &&
+        priorCallSnap != null
+      ) {
+        tx.update(priorCallSnap.ref, {
+          status: 'ended',
+          endedAt: now,
+          endedReason: 'paid_entitlement_expired',
+          updatedAt: now,
+        });
       }
 
-      const currentPoints = (userSnap.data()?.keyCount as number) ?? 0;
+      const currentPoints = requireTrustedPointBalance(userSnap.data());
       const voiceFreeAvailable =
         type === 'voice' && quotaSnap.data()?.freeVoiceCallUsed !== true;
       const chargePoints = type === 'video'
@@ -9030,6 +9726,7 @@ export const startCall = regionalFunctions.https.onCall(
         type,
         status: 'ringing',
         roomName,
+        ringingExpiresAt,
         paidUntilAt: null,
         segmentSeconds: null,
         extensionCount: 0,
@@ -9037,8 +9734,8 @@ export const startCall = regionalFunctions.https.onCall(
         initialChargePoints: chargePoints,
         callerDisplayName: callerData.displayName ?? '',
         calleeDisplayName: targetData.displayName ?? '',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: now,
+        updatedAt: now,
       };
       tx.set(callRef, callPayload);
       tx.set(activeCallRef, {
@@ -9046,7 +9743,8 @@ export const startCall = regionalFunctions.https.onCall(
         matchId,
         participantUids: userIds,
         status: 'ringing',
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ringingExpiresAt,
+        updatedAt: now,
       });
 
       return {
@@ -9055,17 +9753,12 @@ export const startCall = regionalFunctions.https.onCall(
         paidUntilAtMillis: null,
         chargePoints: 0,
         freeSegment: voiceFreeAvailable,
+        ringingExpiresAtMillis: ringingExpiresAt.toMillis(),
       };
     });
 
-    const token = buildAgoraRtcToken({
-      appId,
-      appCertificate,
-      channelName: roomName,
-      uid,
-    });
-
     await notifyIncomingCall({
+      callerUid: uid,
       callerName: result.callerName,
       callId,
       matchId,
@@ -9077,10 +9770,11 @@ export const startCall = regionalFunctions.https.onCall(
       callId,
       roomName,
       agoraAppId: appId,
-      token: token.token,
-      rtcUid: token.rtcUid,
-      tokenExpiresAt: token.expiresAt,
+      token: '',
+      rtcUid: 0,
+      tokenExpiresAt: null,
       paidUntilAt: result.paidUntilAtMillis,
+      ringingExpiresAt: result.ringingExpiresAtMillis,
       chargedPoints: result.chargePoints,
       freeSegment: result.freeSegment,
     };
@@ -9098,117 +9792,101 @@ export const acceptCall = regionalFunctions.https.onCall(
     const { appId, appCertificate } = agoraConfig();
     const callRef = db.collection('calls').doc(callId);
     const accepted = await db.runTransaction(async (tx) => {
-      const callSnap = await tx.get(callRef);
-      if (!callSnap.exists) {
-        throw new functions.https.HttpsError('not-found', 'Call not found');
-      }
-      const callData = callSnap.data() ?? {};
-      if (callData.calleeUid !== uid && callData.callerUid !== uid) {
-        throw new functions.https.HttpsError('permission-denied', 'Not a call participant');
-      }
-      if (callData.status !== 'ringing' && callData.status !== 'accepted') {
-        throw new functions.https.HttpsError('failed-precondition', 'Call is not joinable');
-      }
-      const callerUid = callData.callerUid as string;
-      const calleeUid = callData.calleeUid as string;
-      const callMatchId = callData.matchId as string;
-      if (
-        typeof callerUid !== 'string' || callerUid.length === 0 ||
-        typeof calleeUid !== 'string' || calleeUid.length === 0 ||
-        callerUid === calleeUid ||
-        typeof callMatchId !== 'string' || callMatchId.length === 0
-      ) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'Call participant state is invalid'
-        );
-      }
-      const callerRef = db.collection('users').doc(callerUid);
-      const calleeRef = db.collection('users').doc(calleeUid);
-      const matchRef = db.collection('matches').doc(callMatchId);
-      const callerBlockRef = callerRef.collection('blocks').doc(calleeUid);
-      const calleeBlockRef = calleeRef.collection('blocks').doc(callerUid);
-      const [
-        callerAccountSnap,
-        calleeAccountSnap,
-        matchSnap,
-        callerBlockSnap,
-        calleeBlockSnap,
-      ] = await Promise.all([
-        tx.get(callerRef),
-        tx.get(calleeRef),
-        tx.get(matchRef),
-        tx.get(callerBlockRef),
-        tx.get(calleeBlockRef),
-      ]);
-      assertActiveAccountSnapshot(callerAccountSnap, 'Caller');
-      assertActiveAccountSnapshot(calleeAccountSnap, 'Callee');
-      if (
-        !matchSnap.exists ||
-        matchSnap.data()?.isActive !== true ||
-        !isExactDirectChatParticipants(
-          matchSnap.data()?.userIds,
-          [callerUid, calleeUid]
-        ) ||
-        (matchSnap.data()?.directRoomVersion !== 1 &&
-          matchSnap.data()?.directRoomVersion !== undefined) ||
-        (Array.isArray(matchSnap.data()?.hiddenFor) &&
-          matchSnap.data()!.hiddenFor.length > 0) ||
-        callerBlockSnap.exists ||
-        calleeBlockSnap.exists
-      ) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Call chat room is no longer available'
-        );
-      }
+      const entitlement = await requireCallEntitlement(tx, {
+        callRef,
+        callId,
+        requesterUid: uid,
+        allowedStatuses: ['ringing', 'accepted'],
+        requirePaidEntitlement: false,
+      });
+      const callData = entitlement.callData;
+      const currentPoints = requireTrustedPointBalance(
+        entitlement.callerAccountSnap.data()
+      );
       if (callData.status === 'accepted') {
+        const paidUntilAtMillis = entitlement.paidUntilAtMillis;
+        if (
+          paidUntilAtMillis == null ||
+          paidUntilAtMillis <= entitlement.now.toMillis()
+        ) {
+          throw callClosedError();
+        }
+        const token = buildAgoraRtcToken({
+          appId,
+          appCertificate,
+          channelName: entitlement.roomName,
+          uid,
+          callType: entitlement.callType,
+          paidUntilAtMillis,
+        });
         return {
-          callData,
-          paidUntilAtMillis: callData.paidUntilAt?.toMillis?.() ?? null,
+          roomName: entitlement.roomName,
+          paidUntilAtMillis,
+          chargedPoints: 0,
+          freeSegment: callData.freeSegment === true,
+          token,
         };
       }
 
+      // Only the callee can transition a ringing call into a paid call. The
+      // caller may obtain a token only after observing the accepted state.
+      if (uid !== entitlement.calleeUid) throw callClosedError();
+
       const todayKey = kstDateKey();
-      const quotaRef = db.collection('callDailyQuotas').doc(`${callerUid}_${todayKey}`);
+      const quotaRef = db
+        .collection('callDailyQuotas')
+        .doc(`${entitlement.callerUid}_${todayKey}`);
       const quotaSnap = await tx.get(quotaRef);
-      const callType = callData.type;
       const voiceFreeAvailable =
-        callType === 'voice' && quotaSnap.data()?.freeVoiceCallUsed !== true;
-      const chargePoints = callType === 'video'
+        entitlement.callType === 'voice' &&
+        quotaSnap.data()?.freeVoiceCallUsed !== true;
+      const chargePoints = entitlement.callType === 'video'
         ? VIDEO_SEGMENT_POINTS
         : voiceFreeAvailable
           ? 0
           : VOICE_EXTENSION_POINTS;
-      const segmentSeconds = callType === 'video'
+      const segmentSeconds = entitlement.callType === 'video'
         ? VIDEO_SEGMENT_SECONDS
         : voiceFreeAvailable
           ? VOICE_FREE_SECONDS
           : VOICE_EXTENSION_SECONDS;
-      const currentPoints = (callerAccountSnap.data()?.keyCount as number) ?? 0;
       if (currentPoints < chargePoints) {
         throw new functions.https.HttpsError('resource-exhausted', '포인트가 부족합니다');
       }
 
-      const now = admin.firestore.Timestamp.now();
+      const now = entitlement.now;
       const paidUntilAt = admin.firestore.Timestamp.fromMillis(
         now.toMillis() + segmentSeconds * 1000
       );
+      const token = buildAgoraRtcToken({
+        appId,
+        appCertificate,
+        channelName: entitlement.roomName,
+        uid,
+        callType: entitlement.callType,
+        paidUntilAtMillis: paidUntilAt.toMillis(),
+      });
 
       if (chargePoints > 0) {
-        tx.update(callerRef, {
-          keyCount: admin.firestore.FieldValue.increment(-chargePoints),
+        const nextPointBalance = pointBalanceAfterConsume(
+          currentPoints,
+          chargePoints
+        );
+        tx.update(entitlement.callerRef, {
+          keyCount: nextPointBalance,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
         const pointEventRef = db.collection('pointEvents').doc();
         tx.set(pointEventRef, {
-          uid: callerUid,
+          uid: entitlement.callerUid,
           eventType: 'consume',
           amount: chargePoints,
-          reason: callType === 'video' ? 'video_call_segment' : 'voice_call_segment',
+          reason: entitlement.callType === 'video'
+            ? 'video_call_segment'
+            : 'voice_call_segment',
           balanceBefore: currentPoints,
-          balanceAfter: pointBalanceAfterConsume(currentPoints, chargePoints),
-          matchId: callData.matchId,
+          balanceAfter: nextPointBalance,
+          matchId: entitlement.matchId,
           source: 'acceptCall',
           timestamp: now,
         } as QuotaEventData);
@@ -9216,7 +9894,7 @@ export const acceptCall = regionalFunctions.https.onCall(
 
       if (voiceFreeAvailable) {
         tx.set(quotaRef, {
-          uid: callerUid,
+          uid: entitlement.callerUid,
           dateKey: todayKey,
           freeVoiceCallUsed: true,
           freeVoiceSecondsLimit: VOICE_FREE_SECONDS,
@@ -9230,45 +9908,92 @@ export const acceptCall = regionalFunctions.https.onCall(
       tx.update(callRef, {
         status: 'accepted',
         acceptedAt: now,
+        ringingExpiresAt: admin.firestore.FieldValue.delete(),
         paidUntilAt,
         segmentSeconds,
         freeSegment: voiceFreeAvailable,
         initialChargePoints: chargePoints,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      tx.set(db.collection('activeCalls').doc(callData.matchId), {
+      tx.set(entitlement.activeCallRef, {
         callId,
-        matchId: callData.matchId,
+        matchId: entitlement.matchId,
         participantUids: callData.participantUids ?? [],
         status: 'accepted',
+        ringingExpiresAt: admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
 
       return {
-        callData: {
-          ...callData,
-          status: 'accepted',
-          paidUntilAt,
-        },
+        roomName: entitlement.roomName,
         paidUntilAtMillis: paidUntilAt.toMillis(),
+        chargedPoints: chargePoints,
+        freeSegment: voiceFreeAvailable,
+        token,
       };
-    });
-    const callData = accepted.callData;
-
-    const token = buildAgoraRtcToken({
-      appId,
-      appCertificate,
-      channelName: callData.roomName,
-      uid,
     });
     return {
       callId,
-      roomName: callData.roomName,
+      roomName: accepted.roomName,
       agoraAppId: appId,
-      token: token.token,
-      rtcUid: token.rtcUid,
-      tokenExpiresAt: token.expiresAt,
+      token: accepted.token.token,
+      rtcUid: accepted.token.rtcUid,
+      tokenExpiresAt: accepted.token.expiresAt,
       paidUntilAt: accepted.paidUntilAtMillis,
+      chargedPoints: accepted.chargedPoints,
+      freeSegment: accepted.freeSegment,
+    };
+  }
+);
+
+/**
+ * Returns a fresh participant-specific RTC token only while the complete call
+ * entitlement remains active. This never charges or extends the paid window.
+ */
+export const refreshCallToken = regionalFunctions.https.onCall(
+  async (data: any, context: functions.https.CallableContext) => {
+    const uid = await requireAuthAndNotBanned(context);
+    const callId = data.callId;
+    if (typeof callId !== 'string' || callId.length === 0) {
+      throw new functions.https.HttpsError('invalid-argument', 'callId required');
+    }
+
+    const { appId, appCertificate } = agoraConfig();
+    const refreshed = await db.runTransaction(async (tx) => {
+      const entitlement = await requireCallEntitlement(tx, {
+        callRef: db.collection('calls').doc(callId),
+        callId,
+        requesterUid: uid,
+        allowedStatuses: ['accepted'],
+        requirePaidEntitlement: true,
+      });
+      const paidUntilAtMillis = entitlement.paidUntilAtMillis!;
+      const token = buildAgoraRtcToken({
+        appId,
+        appCertificate,
+        channelName: entitlement.roomName,
+        uid,
+        callType: entitlement.callType,
+        paidUntilAtMillis,
+      });
+      return {
+        roomName: entitlement.roomName,
+        paidUntilAtMillis,
+        freeSegment: entitlement.callData.freeSegment === true,
+        token,
+      };
+    });
+
+    return {
+      callId,
+      roomName: refreshed.roomName,
+      agoraAppId: appId,
+      token: refreshed.token.token,
+      rtcUid: refreshed.token.rtcUid,
+      tokenExpiresAt: refreshed.token.expiresAt,
+      paidUntilAt: refreshed.paidUntilAtMillis,
+      chargedPoints: 0,
+      freeSegment: refreshed.freeSegment,
     };
   }
 );
@@ -9410,47 +10135,132 @@ export const extendCall = regionalFunctions.https.onCall(
     if (typeof callId !== 'string' || callId.length === 0) {
       throw new functions.https.HttpsError('invalid-argument', 'callId required');
     }
+    const clientRequestId = normalizeCallExtensionRequestId(
+      data.clientRequestId
+    );
+    if (clientRequestId == null) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'clientRequestId is invalid'
+      );
+    }
 
+    const { appId, appCertificate } = agoraConfig();
     const callRef = db.collection('calls').doc(callId);
-    const userRef = db.collection('users').doc(uid);
+    const operationId = callExtensionOperationId({
+      callId,
+      uid,
+      clientRequestId,
+    });
+    const operationRef = callRef
+      .collection('extensionOperations')
+      .doc(operationId);
+    const pointEventRef = db.collection('pointEvents').doc(operationId);
     const result = await db.runTransaction(async (tx) => {
-      const [callSnap, userSnap] = await Promise.all([
-        tx.get(callRef),
-        tx.get(userRef),
+      const entitlement = await requireCallEntitlement(tx, {
+        callRef,
+        callId,
+        requesterUid: uid,
+        allowedStatuses: ['accepted'],
+        requirePaidEntitlement: true,
+      });
+      const [operationSnap, pointEventSnap] = await Promise.all([
+        tx.get(operationRef),
+        tx.get(pointEventRef),
       ]);
-      assertActiveAccountSnapshot(userSnap);
-      if (!callSnap.exists) {
-        throw new functions.https.HttpsError('not-found', 'Call not found');
-      }
-      const callData = callSnap.data() ?? {};
-      if (callData.calleeUid !== uid && callData.callerUid !== uid) {
-        throw new functions.https.HttpsError('permission-denied', 'Not a call participant');
-      }
-      if (callData.status !== 'accepted') {
-        throw new functions.https.HttpsError('failed-precondition', 'Call is not active');
+      const operationData = operationSnap.data();
+      const pointEventData = pointEventSnap.data();
+      const replay = decideCallExtensionReplay({
+        operationExists: operationSnap.exists,
+        operation: operationData == null ? undefined : {
+          operationId: operationData.operationId,
+          callId: operationData.callId,
+          uid: operationData.uid,
+          clientRequestId: operationData.clientRequestId,
+          matchId: operationData.matchId,
+          callType: operationData.callType,
+          roomName: operationData.roomName,
+          paidUntilAtMillis:
+            operationData.paidUntilAt?.toMillis?.() ?? null,
+          chargedPoints: operationData.chargedPoints,
+          keyCount: operationData.keyCount,
+          pointEventId: operationData.pointEventId,
+          status: operationData.status,
+        },
+        eventExists: pointEventSnap.exists,
+        event: pointEventData == null ? undefined : {
+          uid: pointEventData.uid,
+          callId: pointEventData.callId,
+          matchId: pointEventData.matchId,
+          eventType: pointEventData.eventType,
+          source: pointEventData.source,
+          reason: pointEventData.reason,
+          amount: pointEventData.amount,
+          balanceBefore: pointEventData.balanceBefore,
+          balanceAfter: pointEventData.balanceAfter,
+          clientRequestId: pointEventData.clientRequestId,
+        },
+        expected: {
+          operationId,
+          callId,
+          uid,
+          clientRequestId,
+          matchId: entitlement.matchId,
+          callType: entitlement.callType,
+          roomName: entitlement.roomName,
+        },
+      });
+      if (replay.action === 'inconsistent') throw callClosedError();
+      if (replay.action === 'replay') {
+        if (
+          replay.paidUntilAtMillis > entitlement.paidUntilAtMillis!
+        ) throw callClosedError();
+        const token = buildAgoraRtcToken({
+          appId,
+          appCertificate,
+          channelName: entitlement.roomName,
+          uid,
+          callType: entitlement.callType,
+          paidUntilAtMillis: replay.paidUntilAtMillis,
+        });
+        return {
+          roomName: entitlement.roomName,
+          paidUntilAtMillis: replay.paidUntilAtMillis,
+          chargedPoints: replay.chargedPoints,
+          keyCount: replay.keyCount,
+          freeSegment: entitlement.callData.freeSegment === true,
+          token,
+          idempotentReplay: true,
+        };
       }
 
-      const callType = callData.type;
-      const chargePoints = callType === 'video'
-        ? VIDEO_SEGMENT_POINTS
-        : VOICE_EXTENSION_POINTS;
-      const segmentSeconds = callType === 'video'
-        ? VIDEO_SEGMENT_SECONDS
-        : VOICE_EXTENSION_SECONDS;
-      const currentPoints = (userSnap.data()?.keyCount as number) ?? 0;
-      if (currentPoints < chargePoints) {
+      const currentPoints = requireTrustedPointBalance(
+        entitlement.requesterAccountSnap.data()
+      );
+      const decision = decideCallExtension({
+        callType: entitlement.callType,
+        currentBalance: currentPoints,
+        paidUntilAtMillis: entitlement.paidUntilAtMillis,
+        nowMillis: entitlement.now.toMillis(),
+      });
+      if (decision.action === 'closed') throw callClosedError();
+      if (decision.action === 'insufficient-points') {
         throw new functions.https.HttpsError('resource-exhausted', '포인트가 부족합니다');
       }
-
-      const now = admin.firestore.Timestamp.now();
-      const currentPaidUntil = callData.paidUntilAt?.toMillis?.() ?? now.toMillis();
-      const baseMillis = Math.max(currentPaidUntil, now.toMillis());
       const nextPaidUntilAt = admin.firestore.Timestamp.fromMillis(
-        baseMillis + segmentSeconds * 1000
+        decision.nextPaidUntilAtMillis
       );
+      const token = buildAgoraRtcToken({
+        appId,
+        appCertificate,
+        channelName: entitlement.roomName,
+        uid,
+        callType: entitlement.callType,
+        paidUntilAtMillis: decision.nextPaidUntilAtMillis,
+      });
 
-      tx.update(userRef, {
-        keyCount: admin.firestore.FieldValue.increment(-chargePoints),
+      tx.update(entitlement.requesterRef, {
+        keyCount: decision.nextBalance,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       tx.update(callRef, {
@@ -9458,31 +10268,62 @@ export const extendCall = regionalFunctions.https.onCall(
         extensionCount: admin.firestore.FieldValue.increment(1),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      const pointEventRef = db.collection('pointEvents').doc();
-      tx.set(pointEventRef, {
+      tx.create(pointEventRef, {
         uid,
+        callId,
         eventType: 'consume',
-        amount: chargePoints,
-        reason: callType === 'video' ? 'video_call_extension' : 'voice_call_extension',
+        amount: decision.chargePoints,
+        reason: entitlement.callType === 'video'
+          ? 'video_call_extension'
+          : 'voice_call_extension',
         balanceBefore: currentPoints,
-        balanceAfter: pointBalanceAfterConsume(currentPoints, chargePoints),
-        matchId: callData.matchId,
+        balanceAfter: decision.nextBalance,
+        matchId: entitlement.matchId,
         source: 'extendCall',
-        timestamp: now,
+        clientRequestId,
+        timestamp: entitlement.now,
       } as QuotaEventData);
+      tx.create(operationRef, {
+        operationId,
+        callId,
+        uid,
+        clientRequestId,
+        matchId: entitlement.matchId,
+        callType: entitlement.callType,
+        roomName: entitlement.roomName,
+        status: 'committed',
+        paidUntilAt: nextPaidUntilAt,
+        chargedPoints: decision.chargePoints,
+        keyCount: decision.nextBalance,
+        pointEventId: operationId,
+        createdAt: entitlement.now,
+      });
 
       return {
+        roomName: entitlement.roomName,
         paidUntilAtMillis: nextPaidUntilAt.toMillis(),
-        chargedPoints: chargePoints,
-        keyCount: pointBalanceAfterConsume(currentPoints, chargePoints),
+        chargedPoints: decision.chargePoints,
+        keyCount: decision.nextBalance,
+        freeSegment: entitlement.callData.freeSegment === true,
+        token,
+        idempotentReplay: false,
       };
     });
 
     return {
       ok: true,
+      callId,
+      roomName: result.roomName,
+      agoraAppId: appId,
+      token: result.token.token,
+      rtcUid: result.token.rtcUid,
+      tokenExpiresAt: result.token.expiresAt,
       paidUntilAt: result.paidUntilAtMillis,
       chargedPoints: result.chargedPoints,
       keyCount: result.keyCount,
+      freeSegment: result.freeSegment,
+      clientRequestId,
+      idempotentReplay: result.idempotentReplay,
     };
   }
 );

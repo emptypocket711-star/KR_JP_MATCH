@@ -33,6 +33,20 @@
       "queryScope": "COLLECTION"
     },
     {
+      "collectionGroup": "matches",
+      "fields": [
+        {
+          "fieldPath": "pairKey",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "isActive",
+          "order": "ASCENDING"
+        }
+      ],
+      "queryScope": "COLLECTION"
+    },
+    {
       "collectionGroup": "users",
       "fields": [
         {

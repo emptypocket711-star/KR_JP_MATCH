@@ -123,6 +123,18 @@ test('never closes when participant states are not exactly one active and one de
   }
 });
 
+test('surfaces banned or otherwise ineligible participants as blocking findings', () => {
+  const result = classify({
+    participantAccounts: [account('alice'), account('bob', 'ineligible')],
+  });
+
+  assert.equal(result.closeUnavailableRooms.length, 0);
+  assert.ok(result.findings.some((finding) =>
+    finding.code === 'close-room-participant-state-conflict' &&
+    finding.matchId === 'room_active'
+  ));
+});
+
 test('never closes a duplicate active pair, conflicting room, or any pointer claim', () => {
   const duplicate = classify({
     activeMatches: [room(), room({ id: 'room_other' })],
