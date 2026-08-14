@@ -61,6 +61,10 @@ replaces that sentinel and adds its executable artifact matrix.
 
 ## Pre-Deploy Checks
 
+When a Functions change touches `keyCount`, point grants, or point consumes,
+complete the staging-only trust audit and re-audit gate in
+`docs/POINT_BALANCE_TRUST_ROLLOUT.md` before deploying those Functions.
+
 Run from the repository root:
 
 ```bash
