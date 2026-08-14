@@ -11,6 +11,9 @@ void main() {
     expect(source, contains('FirebaseFunctions.instanceFor'));
     expect(source, contains('AppConfig.firebaseFunctionsRegion'));
     expect(source, contains("'updateFcmToken'"));
+    expect(source, contains('prepareRegistrationAfterProfileReady()'));
+    expect(source, contains('_ensureTokenRefreshSubscription('));
+    expect(source, contains('_registrationFence.allows(registrationTicket)'));
     expect(source, isNot(contains('FirebaseFirestore.instance')));
     expect(source, isNot(contains("'fcmToken': token")));
   });

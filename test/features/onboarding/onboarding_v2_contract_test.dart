@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hana/features/onboarding/data/onboarding_repository_impl.dart';
 import 'package:hana/features/onboarding/domain/onboarding_repository.dart';
 import 'package:hana/features/onboarding/presentation/onboarding_provider.dart';
 
@@ -82,6 +83,58 @@ void main() {
     );
   });
 
+  test(
+      'FCM session is captured before profile creation and retried after success',
+      () async {
+    final events = <String>[];
+
+    await completeOnboardingThenRegisterFcm(
+      prepareRegistration: () {
+        events.add('registration-prepared');
+        return () async => events.add('registration-attempted');
+      },
+      completeProfile: () async {
+        events.add('profile-started');
+        await Future<void>.delayed(Duration.zero);
+        events.add('profile-saved');
+      },
+    );
+
+    expect(events, [
+      'registration-prepared',
+      'profile-started',
+      'profile-saved',
+      'registration-attempted',
+    ]);
+  });
+
+  test('failed profile creation never attempts FCM registration', () async {
+    var registrationAttempted = false;
+
+    await expectLater(
+      completeOnboardingThenRegisterFcm(
+        prepareRegistration: () => () async => registrationAttempted = true,
+        completeProfile: () async => throw StateError('profile failed'),
+      ),
+      throwsStateError,
+    );
+
+    expect(registrationAttempted, isFalse);
+  });
+
+  test('FCM retry failure does not reverse a successful profile save',
+      () async {
+    var profileSaved = false;
+
+    await completeOnboardingThenRegisterFcm(
+      prepareRegistration: () =>
+          () async => throw StateError('registration failed'),
+      completeProfile: () async => profileSaved = true,
+    );
+
+    expect(profileSaved, isTrue);
+  });
+
   test('onboarding widget delegates all Firebase media access', () {
     final screenSource = File(
       'lib/features/onboarding/presentation/onboarding_screen.dart',
@@ -112,6 +165,11 @@ void main() {
     expect(repositorySource, contains("'reserveMediaUploadV2'"));
     expect(repositorySource, contains('uploadReservedJpegFile('));
     expect(repositorySource, contains("'deleteMyProfilePhoto'"));
+    expect(repositorySource, contains('completeOnboardingThenRegisterFcm('));
+    expect(
+      repositorySource,
+      contains('FcmService().prepareRegistrationAfterProfileReady'),
+    );
     expect(repositorySource, isNot(contains('FirebaseStorage')));
   });
 }

@@ -17,7 +17,8 @@ class FcmService {
   final _registrationFence = FcmTokenRegistrationFence();
 
   Future<void> init() async {
-    if (_registrationFence.isClosed) return;
+    final registrationTicket = _registrationFence.issueTicket();
+    if (registrationTicket == null) return;
     try {
       final settings = await _messaging.requestPermission(
         alert: true,
@@ -25,14 +26,12 @@ class FcmService {
         sound: true,
       );
 
-      if (!_registrationFence.isClosed &&
+      if (_registrationFence.allows(registrationTicket) &&
           (settings.authorizationStatus == AuthorizationStatus.authorized ||
               settings.authorizationStatus ==
                   AuthorizationStatus.provisional)) {
-        await _saveToken();
-        _tokenRefreshSubscription ??= _messaging.onTokenRefresh.listen(
-          (token) => unawaited(_saveTokenBestEffort(token)),
-        );
+        _ensureTokenRefreshSubscription(registrationTicket);
+        await _saveToken(ticket: registrationTicket);
       }
     } catch (_) {
       // Permission and token registration remain retryable on the next auth
@@ -46,24 +45,69 @@ class FcmService {
     _registrationFence.reopen();
   }
 
-  Future<void> _saveToken([String? refreshedToken]) => _registrationFence.run(
-        () => _performTokenRegistration(refreshedToken),
-      );
+  /// Captures the current auth-session fence before profile creation begins.
+  /// The returned callback is safe to invoke only after that creation succeeds;
+  /// a sign-out in between invalidates the captured ticket.
+  Future<void> Function() prepareRegistrationAfterProfileReady() {
+    final registrationTicket = _registrationFence.issueTicket();
+    if (registrationTicket == null) {
+      return () async {};
+    }
+    return () async {
+      try {
+        _ensureTokenRefreshSubscription(registrationTicket);
+        await _saveToken(ticket: registrationTicket);
+      } catch (_) {
+        // Notification registration is best effort. A future auth transition
+        // or token refresh can retry without turning a saved profile into an
+        // onboarding failure.
+      }
+    };
+  }
 
-  Future<void> _performTokenRegistration(String? refreshedToken) async {
-    if (_registrationFence.isClosed) return;
+  void _ensureTokenRefreshSubscription(
+    FcmTokenRegistrationTicket registrationTicket,
+  ) {
+    if (!_registrationFence.allows(registrationTicket)) return;
+    _tokenRefreshSubscription ??= _messaging.onTokenRefresh.listen(
+      (token) => unawaited(_saveTokenBestEffort(token)),
+    );
+  }
+
+  Future<void> _saveToken({
+    String? refreshedToken,
+    FcmTokenRegistrationTicket? ticket,
+  }) {
+    final registrationTicket = ticket ?? _registrationFence.issueTicket();
+    if (registrationTicket == null) return Future<void>.value();
+    return _registrationFence.run(
+      () => _performTokenRegistration(refreshedToken, registrationTicket),
+      ticket: registrationTicket,
+    );
+  }
+
+  Future<void> _performTokenRegistration(
+    String? refreshedToken,
+    FcmTokenRegistrationTicket registrationTicket,
+  ) async {
+    if (!_registrationFence.allows(registrationTicket)) return;
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
     final token = refreshedToken ?? await _messaging.getToken();
-    if (token == null || _registrationFence.isClosed) return;
+    if (token == null || !_registrationFence.allows(registrationTicket)) return;
     await FirebaseFunctions.instanceFor(
       region: AppConfig.firebaseFunctionsRegion,
     ).httpsCallable('updateFcmToken').call({'token': token});
   }
 
   Future<void> _saveTokenBestEffort(String token) async {
+    final registrationTicket = _registrationFence.issueTicket();
+    if (registrationTicket == null) return;
     try {
-      await _saveToken(token);
+      await _saveToken(
+        refreshedToken: token,
+        ticket: registrationTicket,
+      );
     } catch (_) {
       // A later refresh or auth transition retries registration.
     }
@@ -125,14 +169,34 @@ class FcmService {
 }
 
 @visibleForTesting
+class FcmTokenRegistrationTicket {
+  const FcmTokenRegistrationTicket._(this.generation);
+
+  final int generation;
+}
+
+@visibleForTesting
 class FcmTokenRegistrationFence {
   final Set<Future<void>> _pending = <Future<void>>{};
   bool _closed = false;
+  int _generation = 0;
 
   bool get isClosed => _closed;
 
-  Future<void> run(Future<void> Function() action) {
-    if (_closed) return Future<void>.value();
+  FcmTokenRegistrationTicket? issueTicket() =>
+      _closed ? null : FcmTokenRegistrationTicket._(_generation);
+
+  bool allows(FcmTokenRegistrationTicket ticket) =>
+      !_closed && ticket.generation == _generation;
+
+  Future<void> run(
+    Future<void> Function() action, {
+    FcmTokenRegistrationTicket? ticket,
+  }) {
+    final registrationTicket = ticket ?? issueTicket();
+    if (registrationTicket == null || !allows(registrationTicket)) {
+      return Future<void>.value();
+    }
     late final Future<void> pending;
     pending = Future<void>.sync(action);
     _pending.add(pending);
@@ -143,6 +207,7 @@ class FcmTokenRegistrationFence {
 
   void close() {
     _closed = true;
+    _generation += 1;
   }
 
   Future<bool> drain() async {
@@ -157,6 +222,7 @@ class FcmTokenRegistrationFence {
   }
 
   void reopen() {
+    _generation += 1;
     _closed = false;
   }
 }

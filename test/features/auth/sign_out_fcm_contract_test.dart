@@ -25,7 +25,9 @@ void main() {
     expect(fcmSource, contains('FcmTokenRegistrationFence'));
     expect(fcmSource, contains('_registrationFence.close()'));
     expect(fcmSource, contains('await _registrationFence.drain()'));
-    expect(fcmSource, contains('if (_registrationFence.isClosed) return'));
+    expect(fcmSource, contains('_registrationFence.issueTicket()'));
+    expect(
+        fcmSource, contains('_registrationFence.allows(registrationTicket)'));
     expect(fcmSource, contains('void onFirebaseAuthCleared()'));
     expect(
       fcmSource,
@@ -110,6 +112,32 @@ void main() {
     fence.reopen();
     await fence.run(() async => blockedActionRan = true);
     expect(blockedActionRan, isTrue);
+  });
+
+  test('profile-ready retry ticket cannot register after sign-out and reopen',
+      () async {
+    final fence = FcmTokenRegistrationFence();
+    final staleTicket = fence.issueTicket();
+    expect(staleTicket, isNotNull);
+
+    fence.close();
+    fence.reopen();
+
+    var staleRegistrationRan = false;
+    await fence.run(
+      () async => staleRegistrationRan = true,
+      ticket: staleTicket,
+    );
+    expect(staleRegistrationRan, isFalse);
+
+    final nextSessionTicket = fence.issueTicket();
+    expect(nextSessionTicket, isNotNull);
+    var nextSessionRegistrationRan = false;
+    await fence.run(
+      () async => nextSessionRegistrationRan = true,
+      ticket: nextSessionTicket,
+    );
+    expect(nextSessionRegistrationRan, isTrue);
   });
 
   test('failed registration drain requires local token deletion', () async {
