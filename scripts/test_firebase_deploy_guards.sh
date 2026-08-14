@@ -43,7 +43,13 @@ set -euo pipefail
 printf 'npm %s\n' "$*" >> "$HANA_TEST_CALL_LOG"
 NPM
 
-chmod +x "$BIN_DIR/firebase" "$BIN_DIR/gcloud" "$BIN_DIR/npm"
+cat > "$BIN_DIR/rg" <<'RG'
+#!/usr/bin/env bash
+echo "deploy guards must not require ripgrep" >&2
+exit 127
+RG
+
+chmod +x "$BIN_DIR/firebase" "$BIN_DIR/gcloud" "$BIN_DIR/npm" "$BIN_DIR/rg"
 
 grep -Fq \
   '"deploy": "../../scripts/deploy_staging_firebase.sh functions"' \
