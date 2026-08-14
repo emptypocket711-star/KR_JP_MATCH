@@ -2,9 +2,11 @@ import { isAccountDeletedOrDeleting } from './callablePolicy';
 import { hasMinimumAge, parseValidDateOfBirth } from './birthDatePolicy';
 import { hasValidAdultIdentity } from './profileExposurePolicy';
 import { isOwnedProfileMediaPath } from './profilePhotoPolicy';
-import { isValidPointBalance } from './pointPolicy';
+import { pointBalanceTrustIssue } from './pointPolicy';
 
 export const initialOnboardingPointGrantAmount = 3;
+export const profileUploadOnboardingShellProvenance =
+  'reserveMediaUploadV2:profile-onboarding-shell:v1';
 export { profileMediaVisibilityVersion } from './profileMediaVisibilityPolicy';
 export { hasValidAdultIdentity };
 
@@ -32,17 +34,26 @@ const onboardingProfileFields = new Set([
 
 const requiredOnboardingProfileFields = [...onboardingProfileFields];
 
+const profileUploadOnboardingShellFields = new Set([
+  'uid',
+  'accountStatus',
+  'onboardingCompleted',
+  'onboardingShellProvenance',
+  'createdAt',
+  'updatedAt',
+  // These settings/credentials can be written through existing server-owned
+  // or narrowly scoped paths before profile onboarding completes.
+  'notificationsEnabled',
+  'nightQuietEnabled',
+  'uiLanguage',
+  'lastSeenAt',
+  'fcmToken',
+  'fcmTokenUpdatedAt',
+]);
+
 export type OnboardingPointGrantDecision =
   | {
       action: 'none';
-    }
-  | {
-      action: 'write-marker';
-      amount: 0;
-      balanceBefore: number;
-      balanceAfter: number;
-      source: 'onboarding_legacy_balance_v1';
-      legacyBalancePreserved: true;
     }
   | {
       action: 'grant';
@@ -107,79 +118,68 @@ export function onboardingPointEventId(uid: string): string {
   return `onboarding:${normalizedUid}:v1`;
 }
 
-export function onboardingPointEventExplainsBalance(input: {
+export function isExactProfileUploadOnboardingShell(input: {
   uid: string;
-  currentKeyCount: unknown;
-  eventData: Record<string, unknown> | undefined;
+  userData: Record<string, unknown> | undefined;
 }): boolean {
-  const { eventData } = input;
+  const { userData } = input;
   if (
-    !isValidPointBalance(input.currentKeyCount) ||
-    eventData?.uid !== input.uid ||
-    eventData.eventType !== 'grant' ||
-    eventData.balanceBefore !== 0 ||
-    eventData.balanceAfter !== input.currentKeyCount
+    userData == null ||
+    userData.uid !== input.uid ||
+    userData.accountStatus !== 'onboarding' ||
+    userData.onboardingCompleted !== false ||
+    userData.onboardingShellProvenance !==
+      profileUploadOnboardingShellProvenance ||
+    userData.createdAt == null ||
+    userData.updatedAt == null
   ) {
     return false;
   }
 
-  if (eventData.source === 'onboarding_v1') {
-    return (
-      eventData.amount === initialOnboardingPointGrantAmount &&
-      input.currentKeyCount === initialOnboardingPointGrantAmount &&
-      eventData.migrationMarker === false &&
-      eventData.legacyBalancePreserved === false
-    );
-  }
-
-  return (
-    eventData.source === 'onboarding_legacy_balance_v1' &&
-    eventData.amount === 0 &&
-    input.currentKeyCount === 0 &&
-    eventData.migrationMarker === true &&
-    eventData.legacyBalancePreserved === true
+  return Object.keys(userData).every(
+    (field) =>
+      field !== 'keyCount' &&
+      !field.startsWith('pointBalance') &&
+      profileUploadOnboardingShellFields.has(field)
   );
 }
 
 export function decideInitialOnboardingPointGrant(input: {
+  uid: string;
+  userExists: boolean;
+  userData: Record<string, unknown> | undefined;
   initialPointEventExists: boolean;
-  currentKeyCount: unknown;
 }): OnboardingPointGrantDecision {
-  if (input.initialPointEventExists) {
-    if (!isValidPointBalance(input.currentKeyCount)) {
-      throw new RangeError('existing keyCount must be a trusted integer');
-    }
+  if (input.userExists && pointBalanceTrustIssue(input.userData) === null) {
     return { action: 'none' };
   }
 
-  if (input.currentKeyCount === undefined) {
-    return {
-      action: 'grant',
-      amount: initialOnboardingPointGrantAmount,
-      balanceBefore: 0,
-      balanceAfter: initialOnboardingPointGrantAmount,
-      source: 'onboarding_v1',
-      legacyBalancePreserved: false,
-    };
-  }
-
-  if (!isValidPointBalance(input.currentKeyCount)) {
-    throw new RangeError('existing keyCount must be a non-negative integer');
-  }
-
-  if (input.currentKeyCount > 0) {
+  if (input.initialPointEventExists) {
     throw new RangeError(
-      'positive legacy keyCount requires audited point-ledger reconciliation'
+      'existing onboarding point evidence requires audited reconciliation'
+    );
+  }
+
+  const isNewUser = !input.userExists && input.userData === undefined;
+  const isServerCreatedShell =
+    input.userExists &&
+    isExactProfileUploadOnboardingShell({
+      uid: input.uid,
+      userData: input.userData,
+    });
+  if (!isNewUser && !isServerCreatedShell) {
+    throw new RangeError(
+      'untrusted existing point state requires audited reconciliation'
     );
   }
 
   return {
-    action: 'write-marker',
-    amount: 0,
-    balanceBefore: input.currentKeyCount,
-    balanceAfter: input.currentKeyCount,
-    source: 'onboarding_legacy_balance_v1',
-    legacyBalancePreserved: true,
+    action: 'grant',
+    amount: initialOnboardingPointGrantAmount,
+    balanceBefore: 0,
+    balanceAfter: initialOnboardingPointGrantAmount,
+    source: 'onboarding_v1',
+    legacyBalancePreserved: false,
   };
 }
 

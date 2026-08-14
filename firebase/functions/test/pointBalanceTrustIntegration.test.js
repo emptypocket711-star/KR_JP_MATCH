@@ -43,15 +43,36 @@ test('store grants and idempotent returns enforce the point trust boundary', () 
   assert.match(google, /pointBalanceTrustVersion/);
 });
 
-test('onboarding and lounge establish trust only with their server events', () => {
+test('V2 media shell and onboarding use an explicit consumed bootstrap provenance', () => {
+  const reserveMedia = section(
+    'async function reserveMediaUploadForProtocol(',
+    '/**\n * Legacy protocol V1 reservation'
+  );
+  assert.match(
+    reserveMedia,
+    /const isV2ProfileUpload =\s*uploadProtocolVersion === mediaUploadProtocolVersion &&\s*request\.kind === 'profile'/
+  );
+  assert.match(
+    reserveMedia,
+    /\.\.\.\(isV2ProfileUpload[\s\S]*onboardingShellProvenance:\s*profileUploadOnboardingShellProvenance/
+  );
+
   const onboarding = section(
     'export const completeOnboarding =',
     'export const updateMyProfile ='
   );
-  assert.match(onboarding, /onboardingPointEventExplainsBalance/);
-  assert.match(onboarding, /pointBalanceTrustIssue/);
+  assert.match(onboarding, /userExists:\s*userSnap\.exists/);
+  assert.match(onboarding, /userData,/);
+  assert.doesNotMatch(onboarding, /onboardingPointEventExplainsBalance/);
+  assert.match(
+    onboarding,
+    /profileUpdate\.onboardingShellProvenance\s*=\s*admin\.firestore\.FieldValue\.delete\(\)/
+  );
+  assert.match(onboarding, /tx\.create\(initialPointEventRef/);
   assert.match(onboarding, /pointBalanceTrustVersion/);
+});
 
+test('lounge establishes trust only with its server grant event', () => {
   const lounge = section(
     'export const createLoungePost =',
     'export const getLoungePost ='

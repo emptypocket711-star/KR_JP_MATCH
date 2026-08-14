@@ -99,8 +99,8 @@ import { deprecatedLikeResult } from './legacyDiscoveryPolicy';
 import {
   decideInitialOnboardingPointGrant,
   onboardingCompletionBlockReason,
-  onboardingPointEventExplainsBalance,
   onboardingPointEventId,
+  profileUploadOnboardingShellProvenance,
   validateOnboardingProfileInput,
 } from './onboardingPolicy';
 import {
@@ -3474,11 +3474,21 @@ async function reserveMediaUploadForProtocol(
         );
       }
 
+      const isV2ProfileUpload =
+        uploadProtocolVersion === mediaUploadProtocolVersion &&
+        request.kind === 'profile';
       if (!userSnap.exists) {
         tx.create(userRef, {
           uid,
           accountStatus: 'onboarding',
           onboardingCompleted: false,
+          // Only this source-identified shell may bootstrap onboarding points.
+          ...(isV2ProfileUpload
+            ? {
+                onboardingShellProvenance:
+                  profileUploadOnboardingShellProvenance,
+              }
+            : {}),
           createdAt: now,
           updatedAt: now,
         });
@@ -5192,60 +5202,38 @@ export const completeOnboarding = regionalFunctions.https.onCall(
       let pointGrantDecision;
       try {
         pointGrantDecision = decideInitialOnboardingPointGrant({
+          uid,
+          userExists: userSnap.exists,
+          userData,
           initialPointEventExists: initialPointEventSnap.exists,
-          currentKeyCount: userData?.keyCount,
         });
       } catch (_) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'Point balance is invalid'
-        );
-      }
-
-      const existingPointTrustIssue = pointBalanceTrustIssue(userData);
-      if (existingPointTrustIssue === 'quarantined-balance') {
         throw new functions.https.HttpsError(
           'failed-precondition',
           'Point balance requires account review'
         );
       }
+
       if (
-        pointGrantDecision.action === 'none' &&
-        existingPointTrustIssue !== null
+        userData?.onboardingShellProvenance ===
+        profileUploadOnboardingShellProvenance
       ) {
-        if (
-          existingPointTrustIssue !== 'untrusted-balance' ||
-          !onboardingPointEventExplainsBalance({
-            uid,
-            currentKeyCount: userData?.keyCount,
-            eventData: initialPointEventSnap.data(),
-          })
-        ) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            'Point balance requires account review'
-          );
-        }
-        profileUpdate.pointBalanceTrustVersion = pointBalanceTrustVersion;
+        profileUpdate.onboardingShellProvenance =
+          admin.firestore.FieldValue.delete();
       }
 
-      if (pointGrantDecision.action !== 'none') {
-        if (pointGrantDecision.action === 'grant') {
-          profileUpdate.keyCount = pointGrantDecision.balanceAfter;
-        }
+      if (pointGrantDecision.action === 'grant') {
+        profileUpdate.keyCount = pointGrantDecision.balanceAfter;
         profileUpdate.pointBalanceTrustVersion = pointBalanceTrustVersion;
-        tx.set(initialPointEventRef, {
+        tx.create(initialPointEventRef, {
           uid,
           eventType: 'grant',
           amount: pointGrantDecision.amount,
-          reason:
-            pointGrantDecision.action === 'grant'
-              ? 'Initial onboarding point grant'
-              : 'Legacy onboarding balance migration marker',
+          reason: 'Initial onboarding point grant',
           balanceBefore: pointGrantDecision.balanceBefore,
           balanceAfter: pointGrantDecision.balanceAfter,
           source: pointGrantDecision.source,
-          migrationMarker: pointGrantDecision.action === 'write-marker',
+          migrationMarker: false,
           legacyBalancePreserved: pointGrantDecision.legacyBalancePreserved,
           timestamp: now,
         } as QuotaEventData);

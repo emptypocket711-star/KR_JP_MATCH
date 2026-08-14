@@ -5,10 +5,11 @@ const {
   decideInitialOnboardingPointGrant,
   hasValidAdultIdentity,
   initialOnboardingPointGrantAmount,
+  isExactProfileUploadOnboardingShell,
   onboardingCompletionBlockReason,
-  onboardingPointEventExplainsBalance,
   onboardingPointEventId,
   profileMediaVisibilityVersion,
+  profileUploadOnboardingShellProvenance,
   validateOnboardingProfileInput,
 } = require('../lib/onboardingPolicy');
 
@@ -39,9 +40,26 @@ function validProfile(overrides = {}) {
   };
 }
 
+function profileUploadOnboardingShell(overrides = {}) {
+  return {
+    uid: 'alice',
+    accountStatus: 'onboarding',
+    onboardingCompleted: false,
+    onboardingShellProvenance: profileUploadOnboardingShellProvenance,
+    createdAt: 'created-at',
+    updatedAt: 'updated-at',
+    notificationsEnabled: true,
+    ...overrides,
+  };
+}
+
 test('uses a deterministic one-time onboarding point event', () => {
   assert.equal(profileMediaVisibilityVersion, 1);
   assert.equal(initialOnboardingPointGrantAmount, 3);
+  assert.equal(
+    profileUploadOnboardingShellProvenance,
+    'reserveMediaUploadV2:profile-onboarding-shell:v1'
+  );
   assert.equal(
     onboardingPointEventId('alice'),
     'onboarding:alice:v1'
@@ -53,8 +71,10 @@ test('uses a deterministic one-time onboarding point event', () => {
   assert.throws(() => onboardingPointEventId('  '), RangeError);
   assert.deepEqual(
     decideInitialOnboardingPointGrant({
+      uid: 'alice',
+      userExists: false,
+      userData: undefined,
       initialPointEventExists: false,
-      currentKeyCount: undefined,
     }),
     {
       action: 'grant',
@@ -67,116 +87,104 @@ test('uses a deterministic one-time onboarding point event', () => {
   );
   assert.deepEqual(
     decideInitialOnboardingPointGrant({
+      uid: 'alice',
+      userExists: true,
+      userData: {
+        keyCount: 3,
+        pointBalanceTrustVersion: 1,
+      },
       initialPointEventExists: true,
-      currentKeyCount: 3,
     }),
     { action: 'none' }
   );
 });
 
-test('trusts only zero legacy balance and quarantines unexplained balances', () => {
+test('initializes only a missing user or the exact V2 profile-upload shell', () => {
+  const shell = profileUploadOnboardingShell();
+  assert.equal(
+    isExactProfileUploadOnboardingShell({ uid: 'alice', userData: shell }),
+    true
+  );
   assert.deepEqual(
     decideInitialOnboardingPointGrant({
+      uid: 'alice',
+      userExists: true,
+      userData: shell,
       initialPointEventExists: false,
-      currentKeyCount: 0,
     }),
     {
-      action: 'write-marker',
-      amount: 0,
+      action: 'grant',
+      amount: 3,
       balanceBefore: 0,
-      balanceAfter: 0,
-      source: 'onboarding_legacy_balance_v1',
-      legacyBalancePreserved: true,
+      balanceAfter: 3,
+      source: 'onboarding_v1',
+      legacyBalancePreserved: false,
     }
   );
-  for (const balance of [3, 25, -1, Number.NaN, Infinity, 0.5, '3']) {
-    assert.throws(
-      () =>
-        decideInitialOnboardingPointGrant({
-          initialPointEventExists: false,
-          currentKeyCount: balance,
-        }),
-      RangeError
-    );
-  }
-  assert.throws(() =>
-    decideInitialOnboardingPointGrant({
-      initialPointEventExists: true,
-      currentKeyCount: undefined,
-    })
-  );
-});
 
-test('accepts only an exact server-owned onboarding event as balance evidence', () => {
-  const grant = {
-    uid: 'alice',
-    eventType: 'grant',
-    amount: 3,
-    balanceBefore: 0,
-    balanceAfter: 3,
-    source: 'onboarding_v1',
-    migrationMarker: false,
-    legacyBalancePreserved: false,
-  };
-  assert.equal(
-    onboardingPointEventExplainsBalance({
-      uid: 'alice',
-      currentKeyCount: 3,
-      eventData: grant,
-    }),
-    true
-  );
-  assert.equal(
-    onboardingPointEventExplainsBalance({
-      uid: 'alice',
-      currentKeyCount: 4,
-      eventData: grant,
-    }),
-    false
-  );
-  assert.equal(
-    onboardingPointEventExplainsBalance({
-      uid: 'bob',
-      currentKeyCount: 3,
-      eventData: grant,
-    }),
-    false
-  );
-
-  const marker = {
-    uid: 'alice',
-    eventType: 'grant',
-    amount: 0,
-    balanceBefore: 0,
-    balanceAfter: 0,
-    source: 'onboarding_legacy_balance_v1',
-    migrationMarker: true,
-    legacyBalancePreserved: true,
-  };
-  assert.equal(
-    onboardingPointEventExplainsBalance({
-      uid: 'alice',
-      currentKeyCount: 0,
-      eventData: marker,
-    }),
-    true
-  );
-  for (const eventData of [
-    undefined,
-    { ...grant, amount: 4 },
-    { ...grant, balanceBefore: 1 },
-    { ...grant, source: 'client' },
-    { ...marker, legacyBalancePreserved: false },
+  for (const userData of [
+    profileUploadOnboardingShell({ uid: 'bob' }),
+    profileUploadOnboardingShell({ accountStatus: 'active' }),
+    profileUploadOnboardingShell({ onboardingCompleted: true }),
+    profileUploadOnboardingShell({ onboardingShellProvenance: 'legacy-v1' }),
+    profileUploadOnboardingShell({ createdAt: null }),
+    profileUploadOnboardingShell({ keyCount: undefined }),
+    profileUploadOnboardingShell({ keyCount: 0 }),
+    profileUploadOnboardingShell({ pointBalanceTrustVersion: undefined }),
+    profileUploadOnboardingShell({ pointBalanceQuarantined: false }),
+    profileUploadOnboardingShell({ pointBalanceTrustSource: 'unknown' }),
+    profileUploadOnboardingShell({ displayName: 'legacy profile' }),
+    profileUploadOnboardingShell({ status: 'banned' }),
   ]) {
     assert.equal(
-      onboardingPointEventExplainsBalance({
-        uid: 'alice',
-        currentKeyCount: eventData === marker ? 0 : 3,
-        eventData,
-      }),
+      isExactProfileUploadOnboardingShell({ uid: 'alice', userData }),
       false
     );
   }
+});
+
+test('routes every existing untrusted point state through audited reconciliation', () => {
+  const rejectedExistingStates = [
+    { uid: 'alice', accountStatus: 'onboarding', onboardingCompleted: false },
+    { keyCount: 0 },
+    { keyCount: 3 },
+    { keyCount: 3, pointBalanceTrustVersion: 2 },
+    {
+      keyCount: 3,
+      pointBalanceTrustVersion: 1,
+      pointBalanceQuarantined: true,
+    },
+  ];
+
+  for (const userData of rejectedExistingStates) {
+    assert.throws(() =>
+      decideInitialOnboardingPointGrant({
+        uid: 'alice',
+        userExists: true,
+        userData,
+        initialPointEventExists: false,
+      })
+    );
+  }
+
+  // The deterministic event alone is not a complete balance evidence chain.
+  assert.throws(() =>
+    decideInitialOnboardingPointGrant({
+      uid: 'alice',
+      userExists: true,
+      userData: { keyCount: 3 },
+      initialPointEventExists: true,
+    })
+  );
+
+  assert.throws(() =>
+    decideInitialOnboardingPointGrant({
+      uid: 'alice',
+      userExists: false,
+      userData: undefined,
+      initialPointEventExists: true,
+    })
+  );
 });
 
 test('blocks completed users only after a fully usable profile is present', () => {

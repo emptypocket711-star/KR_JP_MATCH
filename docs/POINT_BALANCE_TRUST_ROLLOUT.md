@@ -13,8 +13,13 @@ The audit/apply tool is source-locked to `hana-e2ee6`.
 - A missing, fractional, negative, non-finite, oversized, untrusted, or
   quarantined balance is never converted to zero.
 - A new server grant may establish trust only from an exact stored zero balance.
-  New onboarding may initialize a missing balance because the same transaction
-  creates the deterministic onboarding event and the full balance.
+  New onboarding may initialize a missing balance only when the user document
+  does not exist or is the exact server-created V2 profile-upload shell. That
+  shell carries a one-use provenance marker, has no point/trust/quarantine
+  state, and loses the marker in the successful onboarding transaction.
+- A deterministic onboarding event alone never upgrades an existing untrusted
+  positive balance. Existing untrusted balances, including wrong or future
+  trust versions, must pass the full manifest evidence audit.
 - An existing balance may gain the trust marker only when server-owned
   `pointEvents` form a complete, unambiguous chronological chain from zero to
   the exact current balance.
