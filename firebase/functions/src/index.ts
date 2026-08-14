@@ -74,6 +74,17 @@ import {
   activeAccountIssue,
   callableIdentityIssue,
 } from './callablePolicy';
+import {
+  callEntitlementIssue,
+  callTokenLifetimeSeconds,
+  decideCallExtension,
+  JoinableCallStatus,
+  videoSegmentPoints as VIDEO_SEGMENT_POINTS,
+  videoSegmentSeconds as VIDEO_SEGMENT_SECONDS,
+  voiceExtensionPoints as VOICE_EXTENSION_POINTS,
+  voiceExtensionSeconds as VOICE_EXTENSION_SECONDS,
+  voiceFreeSeconds as VOICE_FREE_SECONDS,
+} from './callEntitlementPolicy';
 import { ageOnReferenceDate, parseValidDateOfBirth } from './birthDatePolicy';
 import { publicAgeFromPrivateProfile } from './publicProfilePolicy';
 import { deprecatedLikeResult } from './legacyDiscoveryPolicy';
@@ -205,12 +216,6 @@ const accountDeletionProcessor = createAccountDeletionProcessor({
   bucket: admin.storage().bucket(),
 });
 const translate = new Translate();
-const VOICE_FREE_SECONDS = 5 * 60;
-const VOICE_EXTENSION_SECONDS = 10 * 60;
-const VIDEO_SEGMENT_SECONDS = 10 * 60;
-const VOICE_EXTENSION_POINTS = 1;
-const VIDEO_SEGMENT_POINTS = 3;
-const CALL_TOKEN_TTL_SECONDS = 60 * 60;
 // firebase-functions v1 FunctionBuilder.runWith mutates the builder. Every
 // specialized runtime must therefore start from a fresh regional builder so
 // its options cannot leak into later callables or triggers.
@@ -1309,14 +1314,40 @@ function agoraUidForFirebaseUid(uid: string): number {
   return digest.readUInt32BE(0) || 1;
 }
 
+const CALL_UNAVAILABLE_MESSAGE = 'Call is unavailable';
+const CALL_CLOSED_MESSAGE = 'Call is closed';
+
+function callUnavailableError(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'permission-denied',
+    CALL_UNAVAILABLE_MESSAGE
+  );
+}
+
+function callClosedError(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'failed-precondition',
+    CALL_CLOSED_MESSAGE
+  );
+}
+
 function buildAgoraRtcToken(params: {
   appId: string;
   appCertificate: string;
   channelName: string;
   uid: string;
+  paidUntilAtMillis: number;
 }): { rtcUid: number; token: string; expiresAt: number } {
+  const nowMillis = Date.now();
+  const lifetimeSeconds = callTokenLifetimeSeconds({
+    paidUntilAtMillis: params.paidUntilAtMillis,
+    nowMillis,
+  });
+  if (lifetimeSeconds == null) {
+    throw callClosedError();
+  }
   const rtcUid = agoraUidForFirebaseUid(params.uid);
-  const expiresAt = Math.floor(Date.now() / 1000) + CALL_TOKEN_TTL_SECONDS;
+  const expiresAt = Math.floor(nowMillis / 1000) + lifetimeSeconds;
   return {
     rtcUid,
     expiresAt,
@@ -1326,25 +1357,185 @@ function buildAgoraRtcToken(params: {
       params.channelName,
       rtcUid,
       RtcRole.PUBLISHER,
-      CALL_TOKEN_TTL_SECONDS,
-      CALL_TOKEN_TTL_SECONDS
+      lifetimeSeconds,
+      lifetimeSeconds
     ),
   };
 }
 
+interface ValidatedCallEntitlement {
+  callData: FirebaseFirestore.DocumentData;
+  callerUid: string;
+  calleeUid: string;
+  matchId: string;
+  callType: 'voice' | 'video';
+  roomName: string;
+  paidUntilAtMillis: number | null;
+  callerRef: FirebaseFirestore.DocumentReference;
+  calleeRef: FirebaseFirestore.DocumentReference;
+  requesterRef: FirebaseFirestore.DocumentReference;
+  callerAccountSnap: FirebaseFirestore.DocumentSnapshot;
+  calleeAccountSnap: FirebaseFirestore.DocumentSnapshot;
+  requesterAccountSnap: FirebaseFirestore.DocumentSnapshot;
+  activeCallRef: FirebaseFirestore.DocumentReference;
+  now: FirebaseFirestore.Timestamp;
+}
+
+async function requireCallEntitlement(
+  tx: FirebaseFirestore.Transaction,
+  params: {
+    callRef: FirebaseFirestore.DocumentReference;
+    callId: string;
+    requesterUid: string;
+    allowedStatuses: readonly JoinableCallStatus[];
+    requirePaidEntitlement: boolean;
+  }
+): Promise<ValidatedCallEntitlement> {
+  const callSnap = await tx.get(params.callRef);
+  const callData = callSnap.data() ?? {};
+  const callerUid = callData.callerUid;
+  const calleeUid = callData.calleeUid;
+  const matchId = callData.matchId;
+  if (
+    !callSnap.exists ||
+    typeof callerUid !== 'string' ||
+    callerUid.length === 0 ||
+    typeof calleeUid !== 'string' ||
+    calleeUid.length === 0 ||
+    callerUid === calleeUid ||
+    typeof matchId !== 'string' ||
+    matchId.length === 0 ||
+    !isExactDirectChatParticipants(
+      callData.participantUids,
+      [callerUid, calleeUid]
+    ) ||
+    !callData.participantUids.includes(params.requesterUid)
+  ) {
+    throw callUnavailableError();
+  }
+
+  const callerRef = db.collection('users').doc(callerUid);
+  const calleeRef = db.collection('users').doc(calleeUid);
+  const matchRef = db.collection('matches').doc(matchId);
+  const pairKey = [callerUid, calleeUid].sort().join('_');
+  const pairRef = db.collection('chatPairs').doc(pairKey);
+  const callerBlockRef = callerRef.collection('blocks').doc(calleeUid);
+  const calleeBlockRef = calleeRef.collection('blocks').doc(callerUid);
+  const activeCallRef = db.collection('activeCalls').doc(matchId);
+  const [
+    callerAccountSnap,
+    calleeAccountSnap,
+    matchSnap,
+    pairSnap,
+    callerBlockSnap,
+    calleeBlockSnap,
+    activeCallSnap,
+  ] = await Promise.all([
+    tx.get(callerRef),
+    tx.get(calleeRef),
+    tx.get(matchRef),
+    tx.get(pairRef),
+    tx.get(callerBlockRef),
+    tx.get(calleeBlockRef),
+    tx.get(activeCallRef),
+  ]);
+  const matchData = matchSnap.data() ?? {};
+  const pairData = pairSnap.data() ?? {};
+  const activeCallData = activeCallSnap.data() ?? {};
+  const paidUntilAtMillis = callData.paidUntilAt?.toMillis?.() ?? null;
+  const now = admin.firestore.Timestamp.now();
+  const issue = callEntitlementIssue({
+    callExists: callSnap.exists,
+    callId: params.callId,
+    requesterUid: params.requesterUid,
+    callerUid,
+    calleeUid,
+    participantUids: callData.participantUids,
+    callMatchId: matchId,
+    callType: callData.type,
+    roomName: callData.roomName,
+    callStatus: callData.status,
+    paidUntilAtMillis,
+    callerActive: activeAccountIssue({
+      exists: callerAccountSnap.exists,
+      userData: callerAccountSnap.data(),
+    }) === null,
+    calleeActive: activeAccountIssue({
+      exists: calleeAccountSnap.exists,
+      userData: calleeAccountSnap.data(),
+    }) === null,
+    matchExists: matchSnap.exists,
+    matchActive: matchData.isActive === true,
+    matchParticipantUids: matchData.userIds,
+    matchDirectRoomVersion: matchData.directRoomVersion,
+    matchHiddenFor: matchData.hiddenFor,
+    pairExists: pairSnap.exists,
+    pairActiveMatchId: pairData.activeMatchId,
+    pairParticipantUids: pairData.userIds,
+    callerBlockedCallee: callerBlockSnap.exists,
+    calleeBlockedCaller: calleeBlockSnap.exists,
+    activeCallExists: activeCallSnap.exists,
+    activeCallId: activeCallData.callId,
+    activeCallMatchId: activeCallData.matchId,
+    activeCallParticipantUids: activeCallData.participantUids,
+    activeCallStatus: activeCallData.status,
+    allowedStatuses: params.allowedStatuses,
+    requirePaidEntitlement: params.requirePaidEntitlement,
+    nowMillis: now.toMillis(),
+  });
+  if (issue === 'closed') throw callClosedError();
+  if (issue !== null) throw callUnavailableError();
+
+  const requesterIsCaller = params.requesterUid === callerUid;
+  return {
+    callData,
+    callerUid,
+    calleeUid,
+    matchId,
+    callType: callData.type as 'voice' | 'video',
+    roomName: callData.roomName as string,
+    paidUntilAtMillis,
+    callerRef,
+    calleeRef,
+    requesterRef: requesterIsCaller ? callerRef : calleeRef,
+    callerAccountSnap,
+    calleeAccountSnap,
+    requesterAccountSnap: requesterIsCaller
+      ? callerAccountSnap
+      : calleeAccountSnap,
+    activeCallRef,
+    now,
+  };
+}
+
 async function notifyIncomingCall(params: {
+  callerUid: string;
   callerName: string;
   callId: string;
   matchId: string;
   recipientUid: string;
   type: 'voice' | 'video';
 }): Promise<void> {
-  const recipientSnap = await db.collection('users').doc(params.recipientUid).get();
-  const recipientData = recipientSnap.data();
-  if (activeAccountIssue({
-    exists: recipientSnap.exists,
-    userData: recipientData,
-  }) !== null) return;
+  let entitlement: ValidatedCallEntitlement;
+  try {
+    entitlement = await db.runTransaction((tx) => requireCallEntitlement(tx, {
+      callRef: db.collection('calls').doc(params.callId),
+      callId: params.callId,
+      requesterUid: params.callerUid,
+      allowedStatuses: ['ringing'],
+      requirePaidEntitlement: false,
+    }));
+  } catch (_) {
+    return;
+  }
+  if (
+    entitlement.callerUid !== params.callerUid ||
+    entitlement.calleeUid !== params.recipientUid ||
+    entitlement.matchId !== params.matchId ||
+    entitlement.callData.type !== params.type
+  ) return;
+
+  const recipientData = entitlement.calleeAccountSnap.data();
   const fcmToken: string | null = recipientData?.fcmToken ?? null;
   const notificationsEnabled: boolean =
     recipientData?.notificationsEnabled ?? true;
@@ -8924,7 +9115,7 @@ export const startChat = regionalFunctions.https.onCall(
 
 /**
  * startCall(data: { matchId: string, type: 'voice' | 'video' })
- * -> { callId, roomName, token, rtcUid, agoraAppId, paidUntilAt, freeSegment }
+ * -> { callId, roomName, agoraAppId, paidUntilAt, freeSegment }
  *
  * Voice policy: one free 5-minute voice call per caller per KST/JST day,
  * then 1 point per 10-minute extension/segment.
@@ -8943,7 +9134,9 @@ export const startCall = regionalFunctions.https.onCall(
       throw new functions.https.HttpsError('invalid-argument', 'matchId required');
     }
 
-    const { appId, appCertificate } = agoraConfig();
+    // Validate server configuration before creating a ringing call, but do not
+    // issue any RTC privilege until acceptCall establishes a paid segment.
+    const { appId } = agoraConfig();
     const matchRef = db.collection('matches').doc(matchId);
     const activeCallRef = db.collection('activeCalls').doc(matchId);
     const userRef = db.collection('users').doc(uid);
@@ -8961,35 +9154,37 @@ export const startCall = regionalFunctions.https.onCall(
         tx.get(activeCallRef),
       ]);
 
-      if (!matchSnap.exists) {
-        throw new functions.https.HttpsError('not-found', 'Chat room not found');
-      }
       const matchData = matchSnap.data() ?? {};
       const userIds = matchData.userIds as string[] | undefined;
       if (
+        !matchSnap.exists ||
         matchData.isActive !== true ||
         !isExactDirectChatParticipants(userIds) ||
-        !userIds.includes(uid)
+        !userIds.includes(uid) ||
+        matchData.directRoomVersion !== 1 ||
+        !Array.isArray(matchData.hiddenFor) ||
+        matchData.hiddenFor.length !== 0
       ) {
-        throw new functions.https.HttpsError('permission-denied', 'Call is not allowed in this room');
-      }
-      if (Array.isArray(matchData.hiddenFor) && matchData.hiddenFor.includes(uid)) {
-        throw new functions.https.HttpsError('permission-denied', 'Call is not allowed in hidden room');
+        throw callUnavailableError();
       }
 
       if (activeAccountIssue({
         exists: userSnap.exists,
         userData: userSnap.data(),
       }) !== null) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'Caller account is unavailable'
-        );
+        throw callUnavailableError();
       }
 
       const targetUid = userIds.find((id) => id !== uid)!;
-      const [targetSnap, callerBlockSnap, targetBlockSnap] = await Promise.all([
+      const pairKey = [...userIds].sort().join('_');
+      const [
+        targetSnap,
+        pairSnap,
+        callerBlockSnap,
+        targetBlockSnap,
+      ] = await Promise.all([
         tx.get(db.collection('users').doc(targetUid)),
+        tx.get(db.collection('chatPairs').doc(pairKey)),
         tx.get(db.collection('users').doc(uid).collection('blocks').doc(targetUid)),
         tx.get(db.collection('users').doc(targetUid).collection('blocks').doc(uid)),
       ]);
@@ -8999,10 +9194,16 @@ export const startCall = regionalFunctions.https.onCall(
           userData: targetSnap.data(),
         }) !== null
       ) {
-        throw new functions.https.HttpsError('permission-denied', 'Target user is unavailable');
+        throw callUnavailableError();
       }
-      if (callerBlockSnap.exists || targetBlockSnap.exists) {
-        throw new functions.https.HttpsError('permission-denied', 'One or both users have blocked each other');
+      if (
+        !pairSnap.exists ||
+        pairSnap.data()?.activeMatchId !== matchId ||
+        !isExactDirectChatParticipants(pairSnap.data()?.userIds, userIds) ||
+        callerBlockSnap.exists ||
+        targetBlockSnap.exists
+      ) {
+        throw callUnavailableError();
       }
 
       if (activeCallSnap.exists) {
@@ -9011,7 +9212,7 @@ export const startCall = regionalFunctions.https.onCall(
           const activeCallSnap = await tx.get(db.collection('calls').doc(activeCallId));
           const activeStatus = activeCallSnap.data()?.status;
           if (activeStatus === 'ringing' || activeStatus === 'accepted') {
-            throw new functions.https.HttpsError('failed-precondition', 'A call is already active');
+            throw callClosedError();
           }
         }
       }
@@ -9068,14 +9269,8 @@ export const startCall = regionalFunctions.https.onCall(
       };
     });
 
-    const token = buildAgoraRtcToken({
-      appId,
-      appCertificate,
-      channelName: roomName,
-      uid,
-    });
-
     await notifyIncomingCall({
+      callerUid: uid,
       callerName: result.callerName,
       callId,
       matchId,
@@ -9087,9 +9282,9 @@ export const startCall = regionalFunctions.https.onCall(
       callId,
       roomName,
       agoraAppId: appId,
-      token: token.token,
-      rtcUid: token.rtcUid,
-      tokenExpiresAt: token.expiresAt,
+      token: '',
+      rtcUid: 0,
+      tokenExpiresAt: null,
       paidUntilAt: result.paidUntilAtMillis,
       chargedPoints: result.chargePoints,
       freeSegment: result.freeSegment,
@@ -9108,117 +9303,96 @@ export const acceptCall = regionalFunctions.https.onCall(
     const { appId, appCertificate } = agoraConfig();
     const callRef = db.collection('calls').doc(callId);
     const accepted = await db.runTransaction(async (tx) => {
-      const callSnap = await tx.get(callRef);
-      if (!callSnap.exists) {
-        throw new functions.https.HttpsError('not-found', 'Call not found');
-      }
-      const callData = callSnap.data() ?? {};
-      if (callData.calleeUid !== uid && callData.callerUid !== uid) {
-        throw new functions.https.HttpsError('permission-denied', 'Not a call participant');
-      }
-      if (callData.status !== 'ringing' && callData.status !== 'accepted') {
-        throw new functions.https.HttpsError('failed-precondition', 'Call is not joinable');
-      }
-      const callerUid = callData.callerUid as string;
-      const calleeUid = callData.calleeUid as string;
-      const callMatchId = callData.matchId as string;
-      if (
-        typeof callerUid !== 'string' || callerUid.length === 0 ||
-        typeof calleeUid !== 'string' || calleeUid.length === 0 ||
-        callerUid === calleeUid ||
-        typeof callMatchId !== 'string' || callMatchId.length === 0
-      ) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'Call participant state is invalid'
-        );
-      }
-      const callerRef = db.collection('users').doc(callerUid);
-      const calleeRef = db.collection('users').doc(calleeUid);
-      const matchRef = db.collection('matches').doc(callMatchId);
-      const callerBlockRef = callerRef.collection('blocks').doc(calleeUid);
-      const calleeBlockRef = calleeRef.collection('blocks').doc(callerUid);
-      const [
-        callerAccountSnap,
-        calleeAccountSnap,
-        matchSnap,
-        callerBlockSnap,
-        calleeBlockSnap,
-      ] = await Promise.all([
-        tx.get(callerRef),
-        tx.get(calleeRef),
-        tx.get(matchRef),
-        tx.get(callerBlockRef),
-        tx.get(calleeBlockRef),
-      ]);
-      assertActiveAccountSnapshot(callerAccountSnap, 'Caller');
-      assertActiveAccountSnapshot(calleeAccountSnap, 'Callee');
-      if (
-        !matchSnap.exists ||
-        matchSnap.data()?.isActive !== true ||
-        !isExactDirectChatParticipants(
-          matchSnap.data()?.userIds,
-          [callerUid, calleeUid]
-        ) ||
-        (matchSnap.data()?.directRoomVersion !== 1 &&
-          matchSnap.data()?.directRoomVersion !== undefined) ||
-        (Array.isArray(matchSnap.data()?.hiddenFor) &&
-          matchSnap.data()!.hiddenFor.length > 0) ||
-        callerBlockSnap.exists ||
-        calleeBlockSnap.exists
-      ) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Call chat room is no longer available'
-        );
-      }
+      const entitlement = await requireCallEntitlement(tx, {
+        callRef,
+        callId,
+        requesterUid: uid,
+        allowedStatuses: ['ringing', 'accepted'],
+        requirePaidEntitlement: false,
+      });
+      const callData = entitlement.callData;
       if (callData.status === 'accepted') {
+        const paidUntilAtMillis = entitlement.paidUntilAtMillis;
+        if (
+          paidUntilAtMillis == null ||
+          paidUntilAtMillis <= entitlement.now.toMillis()
+        ) {
+          throw callClosedError();
+        }
+        const token = buildAgoraRtcToken({
+          appId,
+          appCertificate,
+          channelName: entitlement.roomName,
+          uid,
+          paidUntilAtMillis,
+        });
         return {
-          callData,
-          paidUntilAtMillis: callData.paidUntilAt?.toMillis?.() ?? null,
+          roomName: entitlement.roomName,
+          paidUntilAtMillis,
+          chargedPoints: 0,
+          freeSegment: callData.freeSegment === true,
+          token,
         };
       }
 
+      // Only the callee can transition a ringing call into a paid call. The
+      // caller may obtain a token only after observing the accepted state.
+      if (uid !== entitlement.calleeUid) throw callClosedError();
+
       const todayKey = kstDateKey();
-      const quotaRef = db.collection('callDailyQuotas').doc(`${callerUid}_${todayKey}`);
+      const quotaRef = db
+        .collection('callDailyQuotas')
+        .doc(`${entitlement.callerUid}_${todayKey}`);
       const quotaSnap = await tx.get(quotaRef);
-      const callType = callData.type;
       const voiceFreeAvailable =
-        callType === 'voice' && quotaSnap.data()?.freeVoiceCallUsed !== true;
-      const chargePoints = callType === 'video'
+        entitlement.callType === 'voice' &&
+        quotaSnap.data()?.freeVoiceCallUsed !== true;
+      const chargePoints = entitlement.callType === 'video'
         ? VIDEO_SEGMENT_POINTS
         : voiceFreeAvailable
           ? 0
           : VOICE_EXTENSION_POINTS;
-      const segmentSeconds = callType === 'video'
+      const segmentSeconds = entitlement.callType === 'video'
         ? VIDEO_SEGMENT_SECONDS
         : voiceFreeAvailable
           ? VOICE_FREE_SECONDS
           : VOICE_EXTENSION_SECONDS;
-      const currentPoints = (callerAccountSnap.data()?.keyCount as number) ?? 0;
-      if (currentPoints < chargePoints) {
+      const currentPoints = entitlement.callerAccountSnap.data()?.keyCount;
+      if (
+        !Number.isSafeInteger(currentPoints) ||
+        currentPoints < chargePoints
+      ) {
         throw new functions.https.HttpsError('resource-exhausted', '포인트가 부족합니다');
       }
 
-      const now = admin.firestore.Timestamp.now();
+      const now = entitlement.now;
       const paidUntilAt = admin.firestore.Timestamp.fromMillis(
         now.toMillis() + segmentSeconds * 1000
       );
+      const token = buildAgoraRtcToken({
+        appId,
+        appCertificate,
+        channelName: entitlement.roomName,
+        uid,
+        paidUntilAtMillis: paidUntilAt.toMillis(),
+      });
 
       if (chargePoints > 0) {
-        tx.update(callerRef, {
+        tx.update(entitlement.callerRef, {
           keyCount: admin.firestore.FieldValue.increment(-chargePoints),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
         const pointEventRef = db.collection('pointEvents').doc();
         tx.set(pointEventRef, {
-          uid: callerUid,
+          uid: entitlement.callerUid,
           eventType: 'consume',
           amount: chargePoints,
-          reason: callType === 'video' ? 'video_call_segment' : 'voice_call_segment',
+          reason: entitlement.callType === 'video'
+            ? 'video_call_segment'
+            : 'voice_call_segment',
           balanceBefore: currentPoints,
           balanceAfter: pointBalanceAfterConsume(currentPoints, chargePoints),
-          matchId: callData.matchId,
+          matchId: entitlement.matchId,
           source: 'acceptCall',
           timestamp: now,
         } as QuotaEventData);
@@ -9226,7 +9400,7 @@ export const acceptCall = regionalFunctions.https.onCall(
 
       if (voiceFreeAvailable) {
         tx.set(quotaRef, {
-          uid: callerUid,
+          uid: entitlement.callerUid,
           dateKey: todayKey,
           freeVoiceCallUsed: true,
           freeVoiceSecondsLimit: VOICE_FREE_SECONDS,
@@ -9246,39 +9420,83 @@ export const acceptCall = regionalFunctions.https.onCall(
         initialChargePoints: chargePoints,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      tx.set(db.collection('activeCalls').doc(callData.matchId), {
+      tx.set(entitlement.activeCallRef, {
         callId,
-        matchId: callData.matchId,
+        matchId: entitlement.matchId,
         participantUids: callData.participantUids ?? [],
         status: 'accepted',
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
 
       return {
-        callData: {
-          ...callData,
-          status: 'accepted',
-          paidUntilAt,
-        },
+        roomName: entitlement.roomName,
         paidUntilAtMillis: paidUntilAt.toMillis(),
+        chargedPoints: chargePoints,
+        freeSegment: voiceFreeAvailable,
+        token,
       };
-    });
-    const callData = accepted.callData;
-
-    const token = buildAgoraRtcToken({
-      appId,
-      appCertificate,
-      channelName: callData.roomName,
-      uid,
     });
     return {
       callId,
-      roomName: callData.roomName,
+      roomName: accepted.roomName,
       agoraAppId: appId,
-      token: token.token,
-      rtcUid: token.rtcUid,
-      tokenExpiresAt: token.expiresAt,
+      token: accepted.token.token,
+      rtcUid: accepted.token.rtcUid,
+      tokenExpiresAt: accepted.token.expiresAt,
       paidUntilAt: accepted.paidUntilAtMillis,
+      chargedPoints: accepted.chargedPoints,
+      freeSegment: accepted.freeSegment,
+    };
+  }
+);
+
+/**
+ * Returns a fresh participant-specific RTC token only while the complete call
+ * entitlement remains active. This never charges or extends the paid window.
+ */
+export const refreshCallToken = regionalFunctions.https.onCall(
+  async (data: any, context: functions.https.CallableContext) => {
+    const uid = await requireAuthAndNotBanned(context);
+    const callId = data.callId;
+    if (typeof callId !== 'string' || callId.length === 0) {
+      throw new functions.https.HttpsError('invalid-argument', 'callId required');
+    }
+
+    const { appId, appCertificate } = agoraConfig();
+    const refreshed = await db.runTransaction(async (tx) => {
+      const entitlement = await requireCallEntitlement(tx, {
+        callRef: db.collection('calls').doc(callId),
+        callId,
+        requesterUid: uid,
+        allowedStatuses: ['accepted'],
+        requirePaidEntitlement: true,
+      });
+      const paidUntilAtMillis = entitlement.paidUntilAtMillis!;
+      const token = buildAgoraRtcToken({
+        appId,
+        appCertificate,
+        channelName: entitlement.roomName,
+        uid,
+        paidUntilAtMillis,
+      });
+      return {
+        roomName: entitlement.roomName,
+        paidUntilAtMillis,
+        freeSegment: entitlement.callData.freeSegment === true,
+        token,
+      };
+    });
+
+    return {
+      callId,
+      roomName: refreshed.roomName,
+      agoraAppId: appId,
+      token: refreshed.token.token,
+      rtcUid: refreshed.token.rtcUid,
+      tokenExpiresAt: refreshed.token.expiresAt,
+      paidUntilAt: refreshed.paidUntilAtMillis,
+      chargedPoints: 0,
+      freeSegment: refreshed.freeSegment,
     };
   }
 );
@@ -9421,46 +9639,39 @@ export const extendCall = regionalFunctions.https.onCall(
       throw new functions.https.HttpsError('invalid-argument', 'callId required');
     }
 
+    const { appId, appCertificate } = agoraConfig();
     const callRef = db.collection('calls').doc(callId);
-    const userRef = db.collection('users').doc(uid);
     const result = await db.runTransaction(async (tx) => {
-      const [callSnap, userSnap] = await Promise.all([
-        tx.get(callRef),
-        tx.get(userRef),
-      ]);
-      assertActiveAccountSnapshot(userSnap);
-      if (!callSnap.exists) {
-        throw new functions.https.HttpsError('not-found', 'Call not found');
-      }
-      const callData = callSnap.data() ?? {};
-      if (callData.calleeUid !== uid && callData.callerUid !== uid) {
-        throw new functions.https.HttpsError('permission-denied', 'Not a call participant');
-      }
-      if (callData.status !== 'accepted') {
-        throw new functions.https.HttpsError('failed-precondition', 'Call is not active');
-      }
-
-      const callType = callData.type;
-      const chargePoints = callType === 'video'
-        ? VIDEO_SEGMENT_POINTS
-        : VOICE_EXTENSION_POINTS;
-      const segmentSeconds = callType === 'video'
-        ? VIDEO_SEGMENT_SECONDS
-        : VOICE_EXTENSION_SECONDS;
-      const currentPoints = (userSnap.data()?.keyCount as number) ?? 0;
-      if (currentPoints < chargePoints) {
+      const entitlement = await requireCallEntitlement(tx, {
+        callRef,
+        callId,
+        requesterUid: uid,
+        allowedStatuses: ['accepted'],
+        requirePaidEntitlement: true,
+      });
+      const decision = decideCallExtension({
+        callType: entitlement.callType,
+        currentBalance: entitlement.requesterAccountSnap.data()?.keyCount,
+        paidUntilAtMillis: entitlement.paidUntilAtMillis,
+        nowMillis: entitlement.now.toMillis(),
+      });
+      if (decision.action === 'closed') throw callClosedError();
+      if (decision.action === 'insufficient-points') {
         throw new functions.https.HttpsError('resource-exhausted', '포인트가 부족합니다');
       }
-
-      const now = admin.firestore.Timestamp.now();
-      const currentPaidUntil = callData.paidUntilAt?.toMillis?.() ?? now.toMillis();
-      const baseMillis = Math.max(currentPaidUntil, now.toMillis());
       const nextPaidUntilAt = admin.firestore.Timestamp.fromMillis(
-        baseMillis + segmentSeconds * 1000
+        decision.nextPaidUntilAtMillis
       );
+      const token = buildAgoraRtcToken({
+        appId,
+        appCertificate,
+        channelName: entitlement.roomName,
+        uid,
+        paidUntilAtMillis: decision.nextPaidUntilAtMillis,
+      });
 
-      tx.update(userRef, {
-        keyCount: admin.firestore.FieldValue.increment(-chargePoints),
+      tx.update(entitlement.requesterRef, {
+        keyCount: admin.firestore.FieldValue.increment(-decision.chargePoints),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       tx.update(callRef, {
@@ -9472,27 +9683,40 @@ export const extendCall = regionalFunctions.https.onCall(
       tx.set(pointEventRef, {
         uid,
         eventType: 'consume',
-        amount: chargePoints,
-        reason: callType === 'video' ? 'video_call_extension' : 'voice_call_extension',
-        balanceBefore: currentPoints,
-        balanceAfter: pointBalanceAfterConsume(currentPoints, chargePoints),
-        matchId: callData.matchId,
+        amount: decision.chargePoints,
+        reason: entitlement.callType === 'video'
+          ? 'video_call_extension'
+          : 'voice_call_extension',
+        balanceBefore:
+          entitlement.requesterAccountSnap.data()!.keyCount as number,
+        balanceAfter: decision.nextBalance,
+        matchId: entitlement.matchId,
         source: 'extendCall',
-        timestamp: now,
+        timestamp: entitlement.now,
       } as QuotaEventData);
 
       return {
+        roomName: entitlement.roomName,
         paidUntilAtMillis: nextPaidUntilAt.toMillis(),
-        chargedPoints: chargePoints,
-        keyCount: pointBalanceAfterConsume(currentPoints, chargePoints),
+        chargedPoints: decision.chargePoints,
+        keyCount: decision.nextBalance,
+        freeSegment: entitlement.callData.freeSegment === true,
+        token,
       };
     });
 
     return {
       ok: true,
+      callId,
+      roomName: result.roomName,
+      agoraAppId: appId,
+      token: result.token.token,
+      rtcUid: result.token.rtcUid,
+      tokenExpiresAt: result.token.expiresAt,
       paidUntilAt: result.paidUntilAtMillis,
       chargedPoints: result.chargedPoints,
       keyCount: result.keyCount,
+      freeSegment: result.freeSegment,
     };
   }
 );
