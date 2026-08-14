@@ -7,14 +7,16 @@ path. Flutter sends that path to the Auth + App Check protected
 block, current-reference, and active-room state before and after a
 generation-pinned download, then returns at most one 5 MiB JPEG in memory.
 
-No live Firebase audit, write, or deployment was performed while preparing this
-runbook or its admin tool.
+This runbook does not authorize a live write or deployment. The current staging
+continuation below relies only on a separate read-only live Rules parity check;
+every mutation and deploy still requires its exact guard and approval.
 
 ## Non-negotiable rollout order
 
-1. Complete the direct-room v1 audit/backfill first. Every healthy active chat
-   room must have the server-owned `directRoomVersion == 1` marker, and the
-   `startChat`/room-creation backend must be READY to write it on every new room.
+1. Integrate and locally verify the direct-room v1 new-write backend, then run
+   the complete dry-run audit and review every candidate. Do not apply the
+   marker backfill until that backend is live and READY to write
+   `directRoomVersion == 1` on every new room.
 2. Integrate `profileMediaVisibilityVersion == 1` into successful onboarding
    and profile-update server transactions, and clear it whenever the profile
    ceases to satisfy the full server `isPublicUserProfile` predicate. Audit and
@@ -28,15 +30,17 @@ runbook or its admin tool.
 5. Prepare a client that reads canonical paths through the callable, reads
    legacy Hana Firebase URLs only when no path exists, writes paths only, and
    uploads through the V2 callables only.
-6. In staging only, schedule one destructive maintenance window after backfills
-   and minimum-version enforcement prove no supported staging legacy/V1 writer
-   remains. Announce temporary media unavailability, deploy indexes and wait for
-   `READY`, deploy strict Firestore+Storage Rules with canonical create=false,
-   verify the live rule hashes read-only against the reviewed local strict
-   candidate, immediately deploy V1+V2 Functions, install the V2 APK, then run
-   full E2E. Only afterward enable the exact staging project's server-owned
-   `privateMediaRolloutControls/legacyFinalizeCleanup` control and run the
-   reviewed migration/drain sequence below.
+6. In staging only, schedule one destructive maintenance window after the
+   supported-version review proves no legacy/V1 writer remains. Announce
+   temporary media unavailability, deploy indexes and wait for `READY`, and
+   require strict Storage Rules with canonical create=false to be proven live
+   by authenticated read-only source/hash comparison. Deploy the full V1+V2
+   Functions set while direct-room Firestore tightening is explicitly pending,
+   run the reviewed direct-room marker backfill/re-audit, install and smoke the
+   callable client, then enforce the compatible version gate and deploy only
+   the tightened Firestore Rules. Only afterward enable the exact staging
+   project's server-owned `privateMediaRolloutControls/legacyFinalizeCleanup`
+   control and run the reviewed migration/drain sequence below.
 7. Keep production on its existing transitional rules while the reviewed
    canonical path-only V2-equivalent client is prepared for distribution.
    Functions and indexes may be prepared and validated locally, but the guarded
@@ -57,6 +61,12 @@ Here, "V2-equivalent" means the canonical path-only client and callable
 read/upload contract: reserve through `reserveMediaUploadV2`, transmit the JPEG
 only to `uploadPrivateMediaBytes`, and persist only the confirmed
 canonical path. It does not mean Storage Rules `rules_version = '2'`.
+
+That staging sequence describes the current `hana-e2ee6` continuation, where
+the live Storage source already matches the reviewed strict candidate. If the
+authenticated verifier finds any Storage drift, stop. The Firestore-pending
+acknowledgement is not permission to create or deploy an unreviewed transition
+artifact.
 
 The legacy `reserveMediaUpload` + direct client Storage create +
 `confirmMediaUpload` protocol is V1. Its Functions endpoints must remain

@@ -319,20 +319,20 @@ storage. Do not commit them to the repository.
 
 Use this order per environment. Stop at any failed gate:
 
-1. Deploy the new-write Functions code that sets `directRoomVersion: 1` on every
+1. Deploy the `userIds + isActive + directRoomVersion` composite index and wait
+   until Firebase reports it as `READY`. Do not infer readiness from deploy
+   command success alone.
+2. Deploy the new-write Functions code that sets `directRoomVersion: 1` on every
    newly created or safely reused room. Keep the environment's existing single
    trigger region: staging `hana-e2ee6` uses `us-central1`, while production
    `hana-production-tokyo` uses `asia-northeast1`. Never duplicate the trigger
    set across regions in one project.
-2. Run the complete dry-run audit and review every finding class. If and only
+3. Run the complete dry-run audit and review every finding class. If and only
    if either reviewed legacy state is present, run the separate remediation
    dry-run, explicitly confirmed apply, fresh zero-action remediation audit,
    and a fresh normal audit.
-3. Preserve the new normal-audit manifest digest, run the explicitly confirmed
+4. Preserve the new normal-audit manifest digest, run the explicitly confirmed
    marker backfill, then run a fresh invariant re-audit.
-4. Deploy the `userIds + isActive + directRoomVersion` composite index and wait
-   until Firebase reports it as `READY`. Do not infer readiness from deploy
-   command success alone.
 5. Release an internal app build and verify active chat lists, room reuse,
    leave/restart behavior, unread state, and direct chat on real staging data.
 6. Only after internal verification and supported-version gating, enable the

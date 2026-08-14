@@ -72,6 +72,7 @@ jobs:
         working-directory: .
         run: |
           node scripts/test_validate_live_functions_region.js
+          node --test scripts/test_verify_live_storage_rules.js
           scripts/test_app_check_replay_iam_preflight.sh
           scripts/test_firebase_deploy_guards.sh
           node scripts/validate_private_media_rollout_contract.js

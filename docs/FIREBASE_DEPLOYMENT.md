@@ -159,10 +159,13 @@ Enter this debug secret into the allow list in the Firebase Console for your pro
 
 For ordinary callable migrations such as profile editing, deploy the compatible
 Functions before tightening the corresponding client Firestore writes. Private
-media is the explicit exception: staging uses the destructive strict-Rules-first
-maintenance sequence below, and production Functions remain blocked until the
-reviewed transitional artifact and V1/V2 matrix exist. The current Flutter app
-depends on new callables such as:
+media changes only the Storage half of that order: the reviewed
+environment-compatible Storage artifact must be proven live before V2 media
+Functions (the strict candidate for current staging; a future transitional
+artifact for production). A Firestore rule that removes a client read must
+still wait for its replacement callable and client. Production Functions remain
+blocked until that transitional artifact and its V1/V2 matrix exist. The current
+Flutter app depends on new callables such as:
 
 - `listDiscoveryProfiles`
 - `getPublicProfile`
@@ -170,6 +173,7 @@ depends on new callables such as:
 - `listLoungePosts`
 - `getLoungePost`
 - `listLoungeComments`
+- `listActiveChats`
 - `togglePostLike`
 - `updateMyProfile`
 - `reserveMediaUpload`
@@ -244,28 +248,39 @@ V1/legacy writer and destructive cutover is explicitly approved.
 
 #### Staging destructive cutover
 
-1. Complete direct-room/profile-media audits and backfills. Enforce that no
-   supported staging legacy/V1 writer remains, then announce a destructive
-   maintenance window with temporary media unavailability.
+The current `hana-e2ee6` continuation starts from strict Storage Rules already
+being live. The guarded deploy script re-fetches the exact
+`firebase.storage/hana-e2ee6.firebasestorage.app` release through the authenticated
+Firebase CLI, requires its single `firebase/storage.rules` source SHA-256 to
+match the reviewed local candidate, and fails before deployment on any drift.
+This read-only proof is separate from the Firestore rollout state.
+
+1. Enforce that no supported staging legacy/V1 writer remains, then announce a
+   destructive maintenance window with temporary media unavailability.
 2. Deploy required indexes and the `expireAt` TTL field policies for
    `mediaUploadQuotas`, `mediaUploadRequestQuotas`, and
    `privateMediaReadQuotas`. Wait until every index reports `READY` and verify
    all three TTL policies are enabled for the exact staging project.
-3. Deploy strict Firestore+Storage Rules first. Canonical profile/chat
-   create/get/list/update/delete must all be false.
-4. Fetch the live staging Rules read-only through the supported Firebase API,
-   compare reviewed hashes with the local strict candidate, and verify both
-   canonical create=false blocks. Only after that evidence may the operator set
-   `HANA_CONFIRM_STAGING_STRICT_MEDIA_RULES_LIVE=hana-e2ee6-strict-private-media-live`.
-   Local file inspection alone is not sufficient.
-5. Confirm `hana-e2ee6@appspot.gserviceaccount.com` has
-   `roles/firebaseappcheck.tokenVerifier`. Immediately deploy the V1+V2
-   Functions during the same maintenance window,
-   using both staging acknowledgements shown below. Then install the V2 APK and
-   verify uploads use only `reserveMediaUploadV2` +
-   `uploadPrivateMediaBytes`, reads use the byte proxy, and direct canonical
-   Storage access is denied.
-6. Enable the exact staging project's server-owned
+3. Confirm the read-only live Storage verifier reports the exact reviewed
+   strict source. Canonical profile/chat create/get/list/update/delete must all
+   be false. If it does not match, stop; the Firestore-pending phrase does not
+   authorize a Storage deploy or bypass.
+4. Confirm `hana-e2ee6@appspot.gserviceaccount.com` has
+   `roles/firebaseappcheck.tokenVerifier`, then deploy the full compatible
+   V1+V2 Functions set while the tightened direct-room Firestore Rules remain
+   pending. This makes `listActiveChats` and marker-preserving new writes live
+   before client list reads are denied.
+5. Run the complete direct-room audit. For the current reviewed staging
+   manifest, apply only the single approved `directRoomVersion` marker backfill,
+   using its exact restricted manifest and digest, then re-audit to zero actions.
+   Never put the room/user identifiers in source control or operator output.
+6. Install the V2 candidate APK and smoke `listActiveChats`, room reuse,
+   leave/restart, unread state, and private-media upload/read. Enforce the
+   callable-capable supported-version gate.
+7. Only then deploy the tightened Firestore Rules with the separate direct-room
+   cutover acknowledgement. Fetch the live Firestore Rules read-only afterward
+   and require the reviewed local SHA-256 before continuing.
+8. Enable the exact staging project's server-owned
    `privateMediaRolloutControls/legacyFinalizeCleanup` control, run migration
    apply/re-audit, and repeat media E2E including expired reservation, block
    during reservation, quota boundaries, and denial after block/leave/delete.
@@ -377,34 +392,43 @@ scripts/deploy_staging_firebase.sh firestore:indexes
 ```
 
 After Firebase reports every required index `READY` and all three quota TTL
-policies are enabled on `hana-e2ee6`, continue the staging maintenance window
-by deploying strict rules first:
-
-```bash
-HANA_CONFIRM_PRIVATE_MEDIA_STRICT_CUTOVER=hana-e2ee6-private-media-strict-cutover \
-  scripts/deploy_staging_firebase.sh firestore:rules,storage
-```
-
-Fetch and hash the live staging Rules read-only. After they match the reviewed
-local strict candidate and canonical create=false is confirmed, immediately
-deploy Functions:
+policies are enabled on `hana-e2ee6`, deploy the full compatible Functions set.
+The pending phrase explicitly records that direct-room Firestore tightening is
+deferred; the script independently authenticates and verifies the exact live
+strict Storage Rules source before it builds or deploys:
 
 ```bash
 HANA_FUNCTIONS_LIVE_REGION_CONFIRMED=us-central1 \
 HANA_CONFIRM_STAGING_STRICT_MEDIA_FUNCTIONS=hana-e2ee6-private-media-strict-functions \
-HANA_CONFIRM_STAGING_STRICT_MEDIA_RULES_LIVE=hana-e2ee6-strict-private-media-live \
+HANA_CONFIRM_STAGING_FIRESTORE_RULES_PENDING_DIRECT_ROOM=hana-e2ee6-firestore-rules-pending-direct-room \
+HANA_CONFIRM_STAGING_FUNCTION_RETRY_POLICY=hana-e2ee6-onreservedmediauploaded-retry-only \
   scripts/deploy_staging_firebase.sh functions
 ```
 
-The staging script intentionally has no deploy-all default. Do not reverse this
-order: V2 Functions on permissive old rules would allow a protocol-V2
-authorization to become a direct client Storage capability. Between strict
-Rules and Functions, old media flows may be unavailable; that outage is an
-accepted boundary of the staging destructive maintenance window.
+If the reviewed candidate Firestore Rules are already proven live, use
+`HANA_CONFIRM_STAGING_STRICT_MEDIA_RULES_LIVE=hana-e2ee6-strict-private-media-live`
+instead of the pending phrase. The script rejects both or neither. It always
+performs the authenticated live Storage hash comparison; neither human phrase
+can replace it.
 
-The strict Rules command is therefore not repeated after Functions. Continue
-with V2 APK installation, E2E, then the environment-bound legacy-finalize
-control and migration/drain.
+Next complete the reviewed direct-room audit/backfill/re-audit. The current
+staging manifest authorizes one marker-only backfill; any different count or
+digest is a stop condition. Install the candidate client, pass the
+`listActiveChats` and direct-chat smoke matrix, and enforce the compatible
+supported-version gate. Then tighten only Firestore Rules:
+
+```bash
+HANA_CONFIRM_STAGING_DIRECT_ROOM_FIRESTORE_CUTOVER=hana-e2ee6-direct-room-firestore-cutover \
+  scripts/deploy_staging_firebase.sh firestore:rules
+```
+
+The staging script intentionally has no deploy-all default and rejects granular
+Function targets. `firestore:rules,storage` remains a separately guarded private-
+media cutover target; it is not a shortcut for this continuation and may be used
+only when both its destructive media prerequisites and every Firestore
+compatibility gate are already satisfied. Continue with live Firestore hash
+verification, full E2E, then the environment-bound legacy-finalize control and
+migration/drain.
 
 Production deploys are currently blocked unconditionally by the deny-only
 sentinel. The following commands document the intended future sequence; they
