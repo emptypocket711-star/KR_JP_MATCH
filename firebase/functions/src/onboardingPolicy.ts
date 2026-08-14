@@ -2,6 +2,7 @@ import { isAccountDeletedOrDeleting } from './callablePolicy';
 import { hasMinimumAge, parseValidDateOfBirth } from './birthDatePolicy';
 import { hasValidAdultIdentity } from './profileExposurePolicy';
 import { isOwnedProfileMediaPath } from './profilePhotoPolicy';
+import { isValidPointBalance } from './pointPolicy';
 
 export const initialOnboardingPointGrantAmount = 3;
 export { profileMediaVisibilityVersion } from './profileMediaVisibilityPolicy';
@@ -110,7 +111,12 @@ export function decideInitialOnboardingPointGrant(input: {
   initialPointEventExists: boolean;
   currentKeyCount: unknown;
 }): OnboardingPointGrantDecision {
-  if (input.initialPointEventExists) return { action: 'none' };
+  if (input.initialPointEventExists) {
+    if (!isValidPointBalance(input.currentKeyCount)) {
+      throw new RangeError('existing keyCount must be a trusted integer');
+    }
+    return { action: 'none' };
+  }
 
   if (input.currentKeyCount === undefined) {
     return {
@@ -123,12 +129,14 @@ export function decideInitialOnboardingPointGrant(input: {
     };
   }
 
-  if (
-    typeof input.currentKeyCount !== 'number' ||
-    !Number.isSafeInteger(input.currentKeyCount) ||
-    input.currentKeyCount < 0
-  ) {
+  if (!isValidPointBalance(input.currentKeyCount)) {
     throw new RangeError('existing keyCount must be a non-negative integer');
+  }
+
+  if (input.currentKeyCount > 0) {
+    throw new RangeError(
+      'positive legacy keyCount requires audited point-ledger reconciliation'
+    );
   }
 
   return {

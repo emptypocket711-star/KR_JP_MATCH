@@ -10,6 +10,10 @@ const {
   pointAmountForProduct,
   pointBalanceAfterConsume,
   pointBalanceAfterGrant,
+  isValidPointBalance,
+  maximumPointBalance,
+  pointBalanceTrustIssue,
+  pointBalanceTrustVersion,
   shouldGrantDailyLoungePostPoints,
   canGrantVerifiedPlayPurchase,
   isAlreadyGrantedPlayPurchaseRecord,
@@ -115,9 +119,39 @@ test('classifies Play purchase ledger idempotency state', () => {
 
 test('calculates auditable point balances for grants and consumes', () => {
   assert.equal(pointBalanceAfterGrant(3, 5), 8);
-  assert.equal(pointBalanceAfterGrant(undefined, 5), 5);
   assert.equal(pointBalanceAfterConsume(3, 1), 2);
-  assert.equal(pointBalanceAfterConsume(undefined, 1), -1);
+});
+
+test('rejects malformed, negative, fractional, and oversized point balances', () => {
+  for (const value of [undefined, null, NaN, Infinity, -1, 0.5, maximumPointBalance + 1]) {
+    assert.equal(isValidPointBalance(value), false);
+    assert.throws(() => pointBalanceAfterGrant(value, 1), RangeError);
+    assert.throws(() => pointBalanceAfterConsume(value, 1), RangeError);
+  }
+  assert.equal(isValidPointBalance(0), true);
+  assert.equal(isValidPointBalance(maximumPointBalance), true);
+  assert.throws(() => pointBalanceAfterGrant(maximumPointBalance, 1), RangeError);
+  assert.throws(() => pointBalanceAfterConsume(0, 1), RangeError);
+  assert.throws(() => pointBalanceAfterGrant(1, 0), RangeError);
+  assert.throws(() => pointBalanceAfterConsume(1, 1.5), RangeError);
+});
+
+test('requires the server-owned point balance trust marker before spending', () => {
+  assert.equal(
+    pointBalanceTrustIssue({
+      keyCount: 3,
+      pointBalanceTrustVersion,
+    }),
+    null
+  );
+  assert.equal(pointBalanceTrustIssue({ keyCount: 3 }), 'untrusted-balance');
+  assert.equal(
+    pointBalanceTrustIssue({
+      keyCount: Number.NaN,
+      pointBalanceTrustVersion,
+    }),
+    'invalid-balance'
+  );
 });
 
 test('uses KST day keys for once-daily lounge post point grants', () => {

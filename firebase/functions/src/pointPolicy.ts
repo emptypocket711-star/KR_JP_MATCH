@@ -3,6 +3,8 @@ export type PointPlatform = (typeof pointPlatforms)[number];
 
 export const androidPackageName = 'com.emptypocket.hana';
 export const dailyLoungePostPointGrantAmount = 3;
+export const pointBalanceTrustVersion = 1;
+export const maximumPointBalance = 100_000;
 
 const retiredUnsafePurchaseTokens = new Set(['qa_debug_points_v1']);
 
@@ -58,14 +60,52 @@ export function isStorePointPurchaseEnabled(
   return platform === 'android';
 }
 
+export function isValidPointBalance(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= maximumPointBalance
+  );
+}
+
+export function pointBalanceTrustIssue(
+  userData: Record<string, unknown> | undefined
+): 'invalid-balance' | 'untrusted-balance' | null {
+  if (!isValidPointBalance(userData?.keyCount)) return 'invalid-balance';
+  if (userData?.pointBalanceTrustVersion !== pointBalanceTrustVersion) {
+    return 'untrusted-balance';
+  }
+  return null;
+}
+
+function validatedPointAmount(amount: number): number {
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    throw new RangeError('point amount must be a positive safe integer');
+  }
+  return amount;
+}
+
 export function pointBalanceAfterGrant(currentBalance: unknown, amount: number): number {
-  const current = typeof currentBalance === 'number' ? currentBalance : 0;
-  return current + amount;
+  if (!isValidPointBalance(currentBalance)) {
+    throw new RangeError('current point balance is invalid');
+  }
+  const next = currentBalance + validatedPointAmount(amount);
+  if (!isValidPointBalance(next)) {
+    throw new RangeError('point grant exceeds the maximum trusted balance');
+  }
+  return next;
 }
 
 export function pointBalanceAfterConsume(currentBalance: unknown, amount: number): number {
-  const current = typeof currentBalance === 'number' ? currentBalance : 0;
-  return current - amount;
+  if (!isValidPointBalance(currentBalance)) {
+    throw new RangeError('current point balance is invalid');
+  }
+  const next = currentBalance - validatedPointAmount(amount);
+  if (!isValidPointBalance(next)) {
+    throw new RangeError('point balance is insufficient');
+  }
+  return next;
 }
 
 export function kstDateKey(date = new Date()): string {

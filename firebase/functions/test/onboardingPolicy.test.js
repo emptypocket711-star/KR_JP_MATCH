@@ -67,44 +67,42 @@ test('uses a deterministic one-time onboarding point event', () => {
   assert.deepEqual(
     decideInitialOnboardingPointGrant({
       initialPointEventExists: true,
-      currentKeyCount: undefined,
+      currentKeyCount: 3,
     }),
     { action: 'none' }
   );
 });
 
-test('preserves every existing legacy balance and writes a zero-amount marker', () => {
-  for (const balance of [0, 3, 25]) {
-    assert.deepEqual(
-      decideInitialOnboardingPointGrant({
-        initialPointEventExists: false,
-        currentKeyCount: balance,
-      }),
-      {
-        action: 'write-marker',
-        amount: 0,
-        balanceBefore: balance,
-        balanceAfter: balance,
-        source: 'onboarding_legacy_balance_v1',
-        legacyBalancePreserved: true,
-      }
+test('trusts only zero legacy balance and quarantines unexplained balances', () => {
+  assert.deepEqual(
+    decideInitialOnboardingPointGrant({
+      initialPointEventExists: false,
+      currentKeyCount: 0,
+    }),
+    {
+      action: 'write-marker',
+      amount: 0,
+      balanceBefore: 0,
+      balanceAfter: 0,
+      source: 'onboarding_legacy_balance_v1',
+      legacyBalancePreserved: true,
+    }
+  );
+  for (const balance of [3, 25, -1, Number.NaN, Infinity, 0.5, '3']) {
+    assert.throws(
+      () =>
+        decideInitialOnboardingPointGrant({
+          initialPointEventExists: false,
+          currentKeyCount: balance,
+        }),
+      RangeError
     );
   }
-  assert.throws(
-    () =>
-      decideInitialOnboardingPointGrant({
-        initialPointEventExists: false,
-        currentKeyCount: -1,
-      }),
-    RangeError
-  );
-  assert.throws(
-    () =>
-      decideInitialOnboardingPointGrant({
-        initialPointEventExists: false,
-        currentKeyCount: '3',
-      }),
-    RangeError
+  assert.throws(() =>
+    decideInitialOnboardingPointGrant({
+      initialPointEventExists: true,
+      currentKeyCount: undefined,
+    })
   );
 });
 
