@@ -3479,16 +3479,19 @@ async function reserveMediaUploadForProtocol(
         );
       }
 
-      const isV2ProfileUpload =
-        uploadProtocolVersion === mediaUploadProtocolVersion &&
-        request.kind === 'profile';
+      // Both retained V1 and V2 reservation endpoints are server-owned. While
+      // V1 remains supported during the reviewed transition, a first profile
+      // upload through either endpoint must produce the same exact one-use
+      // onboarding shell; otherwise a legacy client can create an incomplete
+      // user document that completeOnboarding can never safely recognize.
+      const isProfileUpload = request.kind === 'profile';
       if (!userSnap.exists) {
         tx.create(userRef, {
           uid,
           accountStatus: 'onboarding',
           onboardingCompleted: false,
           // Only this source-identified shell may bootstrap onboarding points.
-          ...(isV2ProfileUpload
+          ...(isProfileUpload
             ? {
                 onboardingShellProvenance:
                   profileUploadOnboardingShellProvenance,

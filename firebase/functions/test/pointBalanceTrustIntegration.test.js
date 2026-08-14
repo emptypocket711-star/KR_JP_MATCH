@@ -43,18 +43,18 @@ test('store grants and idempotent returns enforce the point trust boundary', () 
   assert.match(google, /pointBalanceTrustVersion/);
 });
 
-test('V2 media shell and onboarding use an explicit consumed bootstrap provenance', () => {
+test('retained media endpoints create the same consumed onboarding provenance', () => {
   const reserveMedia = section(
     'async function reserveMediaUploadForProtocol(',
     '/**\n * Legacy protocol V1 reservation'
   );
   assert.match(
     reserveMedia,
-    /const isV2ProfileUpload =\s*uploadProtocolVersion === mediaUploadProtocolVersion &&\s*request\.kind === 'profile'/
+    /const isProfileUpload = request\.kind === 'profile'/
   );
   assert.match(
     reserveMedia,
-    /\.\.\.\(isV2ProfileUpload[\s\S]*onboardingShellProvenance:\s*profileUploadOnboardingShellProvenance/
+    /\.\.\.\(isProfileUpload[\s\S]*onboardingShellProvenance:\s*profileUploadOnboardingShellProvenance/
   );
 
   const onboarding = section(

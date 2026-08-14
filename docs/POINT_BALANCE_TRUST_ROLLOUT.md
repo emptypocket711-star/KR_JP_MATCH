@@ -14,7 +14,8 @@ The audit/apply tool is source-locked to `hana-e2ee6`.
   quarantined balance is never converted to zero.
 - A new server grant may establish trust only from an exact stored zero balance.
   New onboarding may initialize a missing balance only when the user document
-  does not exist or is the exact server-created V2 profile-upload shell. That
+  does not exist or is the exact server-created profile-upload shell emitted
+  by either retained V1 or V2 reservation endpoint. That
   shell carries a one-use provenance marker, has no point/trust/quarantine
   state, and loses the marker in the successful onboarding transaction.
 - A deterministic onboarding event alone never upgrades an existing untrusted

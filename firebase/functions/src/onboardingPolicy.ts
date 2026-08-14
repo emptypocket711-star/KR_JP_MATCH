@@ -5,6 +5,8 @@ import { isOwnedProfileMediaPath } from './profilePhotoPolicy';
 import { pointBalanceTrustIssue } from './pointPolicy';
 
 export const initialOnboardingPointGrantAmount = 3;
+// Keep the deployed marker value stable. During the reviewed V1 transition,
+// both server reservation endpoints may mint this exact one-use shell.
 export const profileUploadOnboardingShellProvenance =
   'reserveMediaUploadV2:profile-onboarding-shell:v1';
 export { profileMediaVisibilityVersion } from './profileMediaVisibilityPolicy';
