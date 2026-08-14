@@ -2,6 +2,7 @@ class PublicProfile {
   final String uid;
   final String displayName;
   final int birthYear;
+  final int? publicAge;
   final String gender;
   final String nationality;
   final String residingCountry;
@@ -26,6 +27,7 @@ class PublicProfile {
     required this.uid,
     required this.displayName,
     required this.birthYear,
+    this.publicAge,
     required this.gender,
     required this.nationality,
     required this.residingCountry,
@@ -47,7 +49,7 @@ class PublicProfile {
     this.lastSeenAt,
   });
 
-  int get age => DateTime.now().year - birthYear;
+  int get age => publicAge ?? DateTime.now().year - birthYear;
   bool get isOnlineNow =>
       lastSeenAt != null &&
       DateTime.now().difference(lastSeenAt!).inMinutes < 5;
@@ -55,10 +57,13 @@ class PublicProfile {
       lastSeenAt != null && DateTime.now().difference(lastSeenAt!).inHours < 1;
 
   factory PublicProfile.fromMap(Map<String, dynamic> data) {
+    final callableAge = (data['age'] as num?)?.toInt();
     return PublicProfile(
       uid: data['uid'] as String? ?? '',
       displayName: data['displayName'] as String? ?? 'User',
-      birthYear: (data['birthYear'] as num?)?.toInt() ?? 2000,
+      birthYear: (data['birthYear'] as num?)?.toInt() ??
+          (callableAge == null ? 2000 : DateTime.now().year - callableAge),
+      publicAge: callableAge,
       gender: data['gender'] as String? ?? 'female',
       nationality: data['nationality'] as String? ?? 'KR',
       residingCountry: data['residingCountry'] as String? ?? 'KR',
@@ -80,9 +85,28 @@ class PublicProfile {
       likeCount: (data['likeCount'] as num?)?.toInt() ?? 0,
       avgRating: (data['avgRating'] as num?)?.toDouble() ?? 0.0,
       ratingCount: (data['ratingCount'] as num?)?.toInt() ?? 0,
-      lastSeenAt: data['lastSeenAt'] as DateTime?,
+      lastSeenAt: _callableDateTime(data['lastSeenAt']),
     );
   }
+}
+
+DateTime? _callableDateTime(Object? value) {
+  if (value is DateTime) return value;
+  try {
+    final converted = (value as dynamic).toDate();
+    if (converted is DateTime) return converted;
+  } catch (_) {
+    // Callable timestamps may arrive as a JSON-like seconds map instead.
+  }
+  if (value is! Map) return null;
+  final seconds = value['_seconds'] ?? value['seconds'];
+  final nanoseconds = value['_nanoseconds'] ?? value['nanoseconds'] ?? 0;
+  if (seconds is! num || nanoseconds is! num) return null;
+  return DateTime.fromMicrosecondsSinceEpoch(
+    seconds.toInt() * Duration.microsecondsPerSecond +
+        nanoseconds.toInt() ~/ 1000,
+    isUtc: true,
+  );
 }
 
 class DiscoveryFilter {
@@ -202,6 +226,7 @@ class DiscoveryState {
     String? matchId,
     DiscoveryFilter? filter,
     bool clearMatch = false,
+    bool clearError = false,
   }) {
     return DiscoveryState(
       candidates: candidates ?? this.candidates,
@@ -211,7 +236,7 @@ class DiscoveryState {
       isLoading: isLoading ?? this.isLoading,
       isLoadingMore: isLoadingMore ?? this.isLoadingMore,
       hasMore: hasMore ?? this.hasMore,
-      error: error,
+      error: clearError ? null : (error ?? this.error),
       matchedUser: clearMatch ? null : (matchedUser ?? this.matchedUser),
       matchId: clearMatch ? null : (matchId ?? this.matchId),
       filter: filter ?? this.filter,

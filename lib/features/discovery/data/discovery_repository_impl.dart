@@ -1,141 +1,215 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:flutter/foundation.dart';
+
+import '../../../app/config/app_config.dart';
 import '../domain/candidate.dart';
 import '../domain/discovery_repository.dart';
-import '../../../core/services/firebase_service.dart';
 
 class DiscoveryRepositoryImpl implements DiscoveryRepository {
-  final FirebaseService _firebaseService;
-  final _firestore = FirebaseFirestore.instance;
-  final _auth = FirebaseAuth.instance;
+  DiscoveryRepositoryImpl({FirebaseFunctions? functions})
+      : _functions = functions ??
+            FirebaseFunctions.instanceFor(
+              region: AppConfig.firebaseFunctionsRegion,
+            );
 
-  static const int _pageSize = 50;
-  DocumentSnapshot? _lastDoc;
+  static const int _pageSize = 20;
+
+  final FirebaseFunctions _functions;
+  final Set<String> _loadedUids = <String>{};
+  final Set<String> _passedUids = <String>{};
   bool _hasMore = true;
-  String? _cachedUid;
-  String? _cachedOpposite;
-  Set<String> _cachedBlockedUids = {};
-
-  DiscoveryRepositoryImpl({FirebaseService? firebaseService})
-      : _firebaseService = firebaseService ?? FirebaseService();
 
   @override
   bool get hasMore => _hasMore;
 
   @override
   Future<List<PublicProfile>> fetchUsers({bool reset = false}) async {
-    final currentUser = _auth.currentUser;
-    if (currentUser == null) throw Exception('Login is required');
-    final uid = currentUser.uid;
-
-    if (reset || _cachedUid != uid) {
-      _lastDoc = null;
+    if (reset) {
+      _loadedUids.clear();
       _hasMore = true;
-      _cachedUid = uid;
-
-      final results = await Future.wait([
-        _firestore.collection('users').doc(uid).get(),
-        _firestore.collection('users').doc(uid).collection('blocks').get(),
-      ]).timeout(const Duration(seconds: 10));
-      final myDoc = results[0] as DocumentSnapshot;
-      final blocksSnap = results[1] as QuerySnapshot;
-
-      final myNationality = ((myDoc.data()
-              as Map<String, dynamic>?)?['nationality'] as String?) ??
-          'KR';
-      _cachedOpposite = myNationality == 'KR' ? 'JP' : 'KR';
-      _cachedBlockedUids = blocksSnap.docs.map((d) => d.id).toSet();
     }
+    if (!_hasMore) return const [];
+    final excludedUids = <String>{..._loadedUids, ..._passedUids};
 
-    if (!_hasMore) return [];
-
-    var query = _firestore
-        .collection('users')
-        .where('nationality', isEqualTo: _cachedOpposite)
-        .where('onboardingCompleted', isEqualTo: true)
-        .limit(_pageSize);
-
-    if (_lastDoc != null) {
-      query = query.startAfterDocument(_lastDoc!);
-    }
-
-    final snap = await query.get().timeout(const Duration(seconds: 10));
-
-    _hasMore = snap.docs.length == _pageSize;
-    if (snap.docs.isNotEmpty) _lastDoc = snap.docs.last;
-
-    return snap.docs
-        .where((doc) => doc.id != uid && !_cachedBlockedUids.contains(doc.id))
-        .map((doc) {
-      final data = Map<String, dynamic>.from(doc.data());
-      data['uid'] = doc.id;
-      final ts = data['lastSeenAt'];
-      if (ts != null) {
-        try {
-          data['lastSeenAt'] = (ts as dynamic).toDate() as DateTime;
-        } catch (_) {}
-      }
-      return PublicProfile.fromMap(data);
-    }).toList();
+    final result = await _functions
+        .httpsCallable(
+      'listDiscoveryProfiles',
+      options: HttpsCallableOptions(
+        timeout: const Duration(seconds: 35),
+      ),
+    )
+        .call({
+      'limit': _pageSize,
+      'excludeUids': excludedUids.toList(growable: false),
+    });
+    final page = parseDiscoveryProfilesCallableData(result.data);
+    _hasMore = page.hasMore;
+    _loadedUids.addAll(page.profiles.map((profile) => profile.uid));
+    return page.profiles;
   }
 
   @override
   Future<Map<String, dynamic>> requestCandidates({int limit = 10}) async {
-    try {
-      final callable = _firebaseService.functions.httpsCallable(
-        'requestCandidates',
-      );
-      final result = await callable.call({'limit': limit});
-      return Map<String, dynamic>.from(result.data);
-    } catch (e) {
-      throw Exception('Failed to request candidates: $e');
-    }
+    final result = await _functions
+        .httpsCallable(
+      'requestCandidates',
+      options: HttpsCallableOptions(
+        timeout: const Duration(seconds: 15),
+      ),
+    )
+        .call({'limit': limit});
+    return _stringMap(result.data, 'Invalid candidate response');
   }
 
   @override
   Future<Map<String, dynamic>> likeUser(String targetUid) async {
-    final currentUser = _auth.currentUser;
-    if (currentUser == null) throw Exception('로그인이 필요합니다.');
-
-    final likeDocId = '${currentUser.uid}_$targetUid';
-    final existingLike =
-        await _firestore.collection('likes').doc(likeDocId).get();
-    if (existingLike.exists) {
-      return {'liked': false, 'alreadyLiked': true};
-    }
-
-    await _firestore.collection('likes').doc(likeDocId).set({
-      'fromUid': currentUser.uid,
-      'toUid': targetUid,
-      'createdAt': FieldValue.serverTimestamp(),
-    });
-
-    try {
-      await _firestore
-          .collection('users')
-          .doc(targetUid)
-          .update({'likeCount': FieldValue.increment(1)});
-    } catch (_) {}
-
-    return {'liked': true, 'isMatch': false};
-  }
-
-  @override
-  Future<String> startDirectChat(String targetUid) async {
-    final callable = _firebaseService.functions.httpsCallable('startChat');
-    final result = await callable.call({'targetUid': targetUid});
-    final data = Map<String, dynamic>.from(result.data as Map);
-    return data['matchId'] as String;
+    final result = await _functions
+        .httpsCallable(
+      'likeUser',
+      options: HttpsCallableOptions(
+        timeout: const Duration(seconds: 15),
+      ),
+    )
+        .call({'targetUid': targetUid});
+    return _stringMap(result.data, 'Invalid like response');
   }
 
   @override
   Future<Map<String, dynamic>> passUser(String targetUid) async {
-    try {
-      final callable = _firebaseService.functions.httpsCallable('passUser');
-      final result = await callable.call({'targetUid': targetUid});
-      return Map<String, dynamic>.from(result.data);
-    } catch (e) {
-      return {'passed': true};
+    final result = await _functions
+        .httpsCallable(
+      'passUser',
+      options: HttpsCallableOptions(
+        timeout: const Duration(seconds: 15),
+      ),
+    )
+        .call({'targetUid': targetUid});
+    final data = _stringMap(result.data, 'Invalid pass response');
+    if (data['ok'] != true) {
+      throw const FormatException('Invalid pass response');
     }
+    _passedUids.add(targetUid);
+    return data;
+  }
+
+  @override
+  Future<ProfileDetailResult> getProfileDetail(String targetUid) async {
+    final result = await _functions
+        .httpsCallable(
+      'getProfileDetail',
+      options: HttpsCallableOptions(
+        timeout: const Duration(seconds: 30),
+      ),
+    )
+        .call({'uid': targetUid});
+    return parseProfileDetailCallableData(result.data);
+  }
+
+  @override
+  Future<String> startDirectChat(String targetUid) async {
+    final result = await _functions
+        .httpsCallable(
+      'startChat',
+      options: HttpsCallableOptions(
+        timeout: const Duration(seconds: 30),
+      ),
+    )
+        .call({'targetUid': targetUid});
+    final data = _stringMap(result.data, 'Invalid start-chat response');
+    final matchId = data['matchId'];
+    if (matchId is! String || matchId.isEmpty) {
+      throw const FormatException('Invalid start-chat response');
+    }
+    return matchId;
+  }
+
+  @override
+  Future<void> submitRating({
+    required String ratedUid,
+    required int stars,
+    required List<String> tags,
+  }) async {
+    final result = await _functions
+        .httpsCallable(
+      'submitRating',
+      options: HttpsCallableOptions(
+        timeout: const Duration(seconds: 20),
+      ),
+    )
+        .call({
+      'ratedUid': ratedUid,
+      'stars': stars,
+      'tags': tags,
+    });
+    final data = _stringMap(result.data, 'Invalid rating response');
+    if (data['ok'] != true) {
+      throw const FormatException('Invalid rating response');
+    }
+  }
+}
+
+@immutable
+class DiscoveryProfilesPage {
+  const DiscoveryProfilesPage({
+    required this.profiles,
+    required this.hasMore,
+  });
+
+  final List<PublicProfile> profiles;
+  final bool hasMore;
+}
+
+@visibleForTesting
+DiscoveryProfilesPage parseDiscoveryProfilesCallableData(Object? value) {
+  final data = _stringMap(value, 'Invalid discovery response');
+  final rawProfiles = data['profiles'];
+  final hasMore = data['hasMore'];
+  if (rawProfiles is! List || hasMore is! bool) {
+    throw const FormatException('Invalid discovery response');
+  }
+  final profiles = rawProfiles.map((raw) {
+    final profile = _stringMap(raw, 'Invalid discovery profile');
+    final uid = profile['uid'];
+    if (uid is! String || uid.isEmpty) {
+      throw const FormatException('Invalid discovery profile');
+    }
+    return PublicProfile.fromMap(profile);
+  }).toList(growable: false);
+  return DiscoveryProfilesPage(profiles: profiles, hasMore: hasMore);
+}
+
+@visibleForTesting
+ProfileDetailResult parseProfileDetailCallableData(Object? value) {
+  final data = _stringMap(value, 'Invalid profile-detail response');
+  final profileData = data['profile'];
+  final isOwnProfile = data['isOwnProfile'];
+  final hasActiveChat = data['hasActiveChat'];
+  final hasAlreadyRated = data['hasAlreadyRated'];
+  if (profileData is! Map ||
+      isOwnProfile is! bool ||
+      hasActiveChat is! bool ||
+      hasAlreadyRated is! bool) {
+    throw const FormatException('Invalid profile-detail response');
+  }
+  final profile = PublicProfile.fromMap(
+    _stringMap(profileData, 'Invalid profile-detail response'),
+  );
+  if (profile.uid.isEmpty) {
+    throw const FormatException('Invalid profile-detail response');
+  }
+  return ProfileDetailResult(
+    profile: profile,
+    isOwnProfile: isOwnProfile,
+    hasActiveChat: hasActiveChat,
+    hasAlreadyRated: hasAlreadyRated,
+  );
+}
+
+Map<String, dynamic> _stringMap(Object? value, String message) {
+  if (value is! Map) throw FormatException(message);
+  try {
+    return Map<String, dynamic>.from(value);
+  } catch (_) {
+    throw FormatException(message);
   }
 }

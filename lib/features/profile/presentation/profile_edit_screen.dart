@@ -1,14 +1,17 @@
 import 'dart:io';
-import 'package:cached_network_image/cached_network_image.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_storage/firebase_storage.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+
 import '../../../app/theme/app_theme.dart';
+import '../../../core/media/authenticated_storage_image.dart';
+import '../../../core/media/image_cropper_service.dart';
 import '../../../core/widgets/bottom_nav_bar.dart';
+import '../../auth/presentation/auth_provider.dart';
+import '../domain/profile_edit_data.dart';
+import 'profile_provider.dart';
 
 const _allKeywords = [
   'K-pop',
@@ -47,8 +50,8 @@ const _allKeywords = [
 const _relationshipTypes = [
   ('친구', Icons.people_outline),
   ('언어교환', Icons.translate),
-  ('연애', Icons.favorite_border),
-  ('결혼', Icons.diamond_outlined),
+  ('문화교류', Icons.public_outlined),
+  ('친한친구', Icons.favorite_border),
 ];
 
 class ProfileEditScreen extends ConsumerStatefulWidget {
@@ -67,7 +70,7 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
   final _nameCtrl = TextEditingController();
   final _bioCtrl = TextEditingController();
   String _relationshipType = '';
-  int _birthYear = 1995;
+  DateTime? _dateOfBirth;
   String? _gender;
   String? _nationality;
   String? _residingCountry;
@@ -92,102 +95,159 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
     super.dispose();
   }
 
-  String? _normalizeAny(String? value) => value == 'all' ? 'any' : value;
-
   Future<void> _loadProfile() async {
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return;
-    final doc =
-        await FirebaseFirestore.instance.collection('users').doc(uid).get();
-    final d = doc.data() ?? {};
-    setState(() {
-      _photoUrls = (d['photoUrls'] as List?)?.cast<String>() ?? [];
-      _nameCtrl.text = d['displayName'] as String? ?? '';
-      _bioCtrl.text = d['bio'] as String? ?? '';
-      _relationshipType = d['relationshipType'] as String? ?? '';
-      _birthYear = d['birthYear'] as int? ?? 1995;
-      _gender = d['gender'] as String?;
-      _nationality = d['nationality'] as String?;
-      _residingCountry = d['residingCountry'] as String?;
-      _nativeLanguage = d['nativeLanguage'] as String?;
-      _learningLanguage = d['learningLanguage'] as String?;
-      _keywords = (d['keywords'] as List?)?.cast<String>() ?? [];
-      _preferredGender = _normalizeAny(d['preferredGender'] as String?);
-      _preferredNationality =
-          _normalizeAny(d['preferredNationality'] as String?);
-      _preferredAgeMin = d['preferredAgeMin'] as int? ?? 18;
-      _preferredAgeMax = d['preferredAgeMax'] as int? ?? 50;
-      _loading = false;
-    });
+    try {
+      final profile =
+          await ref.read(profileRepositoryProvider).getMyProfileForEdit();
+      if (!mounted) return;
+      setState(() {
+        _photoUrls = [...profile.photoUrls];
+        _nameCtrl.text = profile.displayName;
+        _bioCtrl.text = profile.bio;
+        _relationshipType = profile.relationshipType;
+        _dateOfBirth = profile.dateOfBirth;
+        _gender = profile.gender;
+        _nationality = profile.nationality;
+        _residingCountry = profile.residingCountry;
+        _nativeLanguage = profile.nativeLanguage;
+        _learningLanguage = profile.learningLanguage;
+        _keywords = [...profile.keywords];
+        _preferredGender = profile.preferredGender;
+        _preferredNationality = profile.preferredNationality;
+        _preferredAgeMin = profile.preferredAgeMin;
+        _preferredAgeMax = profile.preferredAgeMax;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('프로필을 불러오지 못했어요: $error')),
+      );
+    }
   }
 
   Future<void> _addPhoto() async {
     if (_photoUrls.length >= 6) return;
     final picker = ImagePicker();
     final image = await picker.pickImage(source: ImageSource.gallery);
-    if (image == null) return;
+    if (image == null || !mounted) return;
 
-    setState(() => _saving = true);
+    String? sanitizedPath;
     try {
-      final uid = FirebaseAuth.instance.currentUser!.uid;
-      final ref = FirebaseStorage.instance
-          .ref('users/$uid/photo_${DateTime.now().millisecondsSinceEpoch}.jpg');
-      await ref.putFile(File(image.path));
-      final url = await ref.getDownloadURL();
-      setState(() => _photoUrls = [..._photoUrls, url]);
-    } catch (e) {
+      sanitizedPath = await cropImageForUpload(
+        context,
+        sourcePath: image.path,
+        preferSquare: true,
+      );
+      if (sanitizedPath == null || !mounted) return;
+      setState(() => _saving = true);
+      final path = await ref
+          .read(profileRepositoryProvider)
+          .uploadMyProfilePhoto(File(sanitizedPath));
+      if (mounted) setState(() => _photoUrls = [..._photoUrls, path]);
+    } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('사진 업로드 실패: $e')));
+            .showSnackBar(SnackBar(content: Text('사진 업로드 실패: $error')));
+      }
+    } finally {
+      if (sanitizedPath != null) {
+        await deleteSanitizedUploadTempFile(sanitizedPath);
+      }
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _removePhoto(int index) async {
+    if (_saving || index < 0 || index >= _photoUrls.length) return;
+    final reference = _photoUrls[index];
+    setState(() => _saving = true);
+    try {
+      await ref.read(profileRepositoryProvider).deleteMyProfilePhoto(reference);
+      if (mounted) {
+        setState(() => _photoUrls = [..._photoUrls]..remove(reference));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('사진 삭제 실패: $error')),
+        );
       }
     } finally {
       if (mounted) setState(() => _saving = false);
     }
   }
 
-  void _removePhoto(int index) {
-    setState(() => _photoUrls = [..._photoUrls]..removeAt(index));
-  }
-
   Future<void> _save() async {
     final name = _nameCtrl.text.trim();
-    if (name.length < 2) {
+    if (name.length < 2 || name.length > 20) {
       ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('닉네임을 2자 이상 입력해주세요')));
+          .showSnackBar(const SnackBar(content: Text('닉네임은 2~20자로 입력해주세요')));
       return;
     }
-    if (_photoUrls.isEmpty) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('사진을 1장 이상 등록해주세요')));
+    if (_photoUrls.any((value) => !isCanonicalStorageMediaPath(value))) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('기존 사진을 삭제하고 다시 등록해주세요')),
+      );
+      return;
+    }
+    final birthDate = _dateOfBirth;
+    if (birthDate == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('정확한 생년월일을 선택해주세요')),
+      );
+      return;
+    }
+    if (_relationshipType.isEmpty ||
+        _gender == null ||
+        _nationality == null ||
+        _residingCountry == null ||
+        _nativeLanguage == null ||
+        _learningLanguage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('기본 정보와 언어를 모두 선택해주세요')),
+      );
+      return;
+    }
+    if (_nativeLanguage == _learningLanguage) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('모국어와 배우는 언어는 달라야 해요')),
+      );
       return;
     }
 
     setState(() => _saving = true);
     try {
-      final uid = FirebaseAuth.instance.currentUser!.uid;
-      await FirebaseFirestore.instance.collection('users').doc(uid).update({
-        'displayName': name,
-        'bio': _bioCtrl.text.trim(),
-        'relationshipType': _relationshipType,
-        'birthYear': _birthYear,
-        'gender': _gender,
-        'nationality': _nationality,
-        'residingCountry': _residingCountry,
-        'nativeLanguage': _nativeLanguage,
-        'learningLanguage': _learningLanguage,
-        'keywords': _keywords,
-        'photoUrls': _photoUrls,
-        'preferredGender': _normalizeAny(_preferredGender),
-        'preferredNationality': _normalizeAny(_preferredNationality),
-        'preferredAgeMin': _preferredAgeMin,
-        'preferredAgeMax': _preferredAgeMax,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-      if (mounted) context.go('/profile');
-    } catch (e) {
+      await ref.read(profileRepositoryProvider).saveMyProfile(
+            ProfileEditData(
+              photoUrls: _photoUrls,
+              displayName: name,
+              bio: _bioCtrl.text.trim(),
+              relationshipType: _relationshipType,
+              birthYear: birthDate.year,
+              birthMonth: birthDate.month,
+              birthDay: birthDate.day,
+              gender: _gender,
+              nationality: _nationality,
+              residingCountry: _residingCountry,
+              nativeLanguage: _nativeLanguage,
+              learningLanguage: _learningLanguage,
+              keywords: _keywords,
+              preferredGender: _preferredGender,
+              preferredNationality: _preferredNationality,
+              preferredAgeMin: _preferredAgeMin,
+              preferredAgeMax: _preferredAgeMax,
+            ),
+          );
+      if (mounted) {
+        ref.invalidate(profileAccessProvider);
+        context.go('/splash');
+      }
+    } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('저장 실패: $e')));
+            .showSnackBar(SnackBar(content: Text('저장 실패: $error')));
       }
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -202,7 +262,7 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
         title: const Text('프로필 편집'),
         leading: IconButton(
           icon: const Icon(Icons.close),
-          onPressed: () => context.go('/profile'),
+          onPressed: () => context.go('/settings'),
         ),
         actions: [
           TextButton(
@@ -312,7 +372,10 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
       children: [
         ClipRRect(
           borderRadius: BorderRadius.circular(12),
-          child: CachedNetworkImage(imageUrl: url, fit: BoxFit.cover),
+          child: AuthenticatedStorageImage(
+            reference: url,
+            fit: BoxFit.cover,
+          ),
         ),
         if (index == 0)
           Positioned(
@@ -331,16 +394,19 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
             ),
           ),
         Positioned(
-          top: 4,
-          right: 4,
-          child: GestureDetector(
-            onTap: () => _removePhoto(index),
-            child: Container(
-              width: 22,
-              height: 22,
-              decoration: const BoxDecoration(
-                  color: Colors.black54, shape: BoxShape.circle),
-              child: const Icon(Icons.close, color: Colors.white, size: 14),
+          top: 0,
+          right: 0,
+          child: Semantics(
+            button: true,
+            label: '사진 제거',
+            child: SizedBox.square(
+              dimension: 48,
+              child: IconButton(
+                tooltip: '사진 제거',
+                onPressed: () => _removePhoto(index),
+                icon: const Icon(Icons.close, color: Colors.white, size: 18),
+                style: IconButton.styleFrom(backgroundColor: Colors.black54),
+              ),
             ),
           ),
         ),
@@ -373,7 +439,12 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
 
   // ── 기본 정보 ─────────────────────────────────────────
   Widget _basicInfoSection() {
-    final age = DateTime.now().year - _birthYear;
+    final birthDate = _dateOfBirth;
+    final birthDateLabel = birthDate == null
+        ? '선택해주세요'
+        : '${birthDate.year}.${birthDate.month.toString().padLeft(2, '0')}.'
+            '${birthDate.day.toString().padLeft(2, '0')} '
+            '(${_ageOn(birthDate)}세)';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -389,23 +460,25 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
         const SizedBox(height: 20),
         Row(
           children: [
-            const Text('출생연도',
+            const Text('생년월일',
                 style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
             const Spacer(),
-            Text('$_birthYear년생 ($age세)',
+            TextButton(
+              onPressed: _selectDateOfBirth,
+              child: Text(
+                birthDateLabel,
                 style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: AppTheme.primary)),
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.primary,
+                ),
+              ),
+            ),
           ],
         ),
-        Slider(
-          value: _birthYear.toDouble(),
-          min: 1950,
-          max: 2007,
-          divisions: 57,
-          activeColor: AppTheme.primary,
-          onChanged: (v) => setState(() => _birthYear = v.toInt()),
+        const Text(
+          '나이 확인을 위해 정확한 날짜가 필요하며 다른 사용자에게는 나이만 보여요.',
+          style: TextStyle(fontSize: 12, color: AppTheme.textSecondary),
         ),
         const SizedBox(height: 8),
         const Text('성별',
@@ -422,6 +495,40 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
         ),
       ],
     );
+  }
+
+  Future<void> _selectDateOfBirth() async {
+    final today = DateTime.now();
+    final lastDate = DateTime(today.year - 18, today.month, today.day);
+    final firstDate = DateTime(1900);
+    final current = _dateOfBirth;
+    final initialDate = current != null &&
+            !current.isBefore(firstDate) &&
+            !current.isAfter(lastDate)
+        ? current
+        : lastDate;
+    final selected = await showDatePicker(
+      context: context,
+      initialDate: initialDate,
+      firstDate: firstDate,
+      lastDate: lastDate,
+      helpText: '생년월일 선택',
+      cancelText: '취소',
+      confirmText: '확인',
+    );
+    if (selected != null && mounted) {
+      setState(() => _dateOfBirth = selected);
+    }
+  }
+
+  int _ageOn(DateTime birthDate) {
+    final today = DateTime.now();
+    var age = today.year - birthDate.year;
+    if (today.month < birthDate.month ||
+        (today.month == birthDate.month && today.day < birthDate.day)) {
+      age -= 1;
+    }
+    return age;
   }
 
   // ── 관계 유형 ─────────────────────────────────────────
@@ -691,7 +798,7 @@ class _ProfileEditScreenState extends ConsumerState<ProfileEditScreen> {
               color: selected
                   ? AppTheme.primary
                   : onTap == null
-                      ? AppTheme.divider.withOpacity(0.4)
+                      ? AppTheme.divider.withValues(alpha: 0.4)
                       : AppTheme.divider),
         ),
         child: Row(

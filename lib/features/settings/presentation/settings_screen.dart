@@ -1,4 +1,3 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -7,8 +6,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../app/providers/font_size_provider.dart';
+import '../../../app/config/app_config.dart';
 import '../../../app/theme/app_theme.dart';
 import '../../../core/i18n/ui_text.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 import '../../../core/widgets/bottom_nav_bar.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../auth/presentation/auth_provider.dart';
@@ -110,8 +111,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
     if (confirmed != true) return;
 
-    await ref.read(authRepositoryProvider).signOut();
-    if (mounted) context.go('/login');
+    try {
+      await ref.read(authRepositoryProvider).signOut();
+      if (mounted) context.go('/login');
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(context.t(
+            '알림 연결을 안전하게 해제하지 못했어요. 네트워크를 확인하고 다시 시도해주세요.',
+            '通知の接続を安全に解除できませんでした。通信状態を確認してもう一度お試しください。',
+          )),
+        ),
+      );
+    }
   }
 
   Future<void> _deleteAccount() async {
@@ -145,7 +158,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     setState(() => _isDeleting = true);
 
     try {
-      await FirebaseFunctions.instance.httpsCallable('deleteAccount').call();
+      await FirebaseFunctions.instanceFor(
+        region: AppConfig.firebaseFunctionsRegion,
+      ).httpsCallable('deleteAccount').call();
       await ref.read(authRepositoryProvider).signOut();
     } on FirebaseFunctionsException catch (e) {
       if (!mounted) return;
@@ -414,9 +429,19 @@ class _ProfileCard extends StatelessWidget {
                   width: 72,
                   height: 72,
                   child: photoUrl.isNotEmpty
-                      ? CachedNetworkImage(
-                          imageUrl: photoUrl,
+                      ? AuthenticatedStorageImage(
+                          reference: photoUrl,
                           fit: BoxFit.cover,
+                          placeholder: DefaultAvatar(
+                            nationality: nationality,
+                            gender: gender,
+                            fit: BoxFit.cover,
+                          ),
+                          errorWidget: DefaultAvatar(
+                            nationality: nationality,
+                            gender: gender,
+                            fit: BoxFit.cover,
+                          ),
                         )
                       : DefaultAvatar(
                           nationality: nationality,

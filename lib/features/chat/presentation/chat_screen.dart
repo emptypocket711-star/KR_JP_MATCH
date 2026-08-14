@@ -1,7 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:uuid/uuid.dart';
+import '../../../core/media/authenticated_storage_image.dart';
+import '../../../core/media/image_cropper_service.dart';
+import '../../auth/presentation/auth_provider.dart';
 import '../domain/chat_message.dart';
 import 'chat_provider.dart';
 import '../../safety/presentation/report_bottom_sheet.dart';
@@ -38,11 +44,23 @@ class ChatScreen extends ConsumerStatefulWidget {
 }
 
 class _ChatScreenState extends ConsumerState<ChatScreen> {
+  static const _uuid = Uuid();
+
   final _messageController = TextEditingController();
   bool _showIcebreakers = true;
+  bool _isSendingMessage = false;
+  bool _isSendingImage = false;
+  String? _pendingText;
+  String? _pendingTextRequestId;
+  String? _pendingImageLocalPath;
+  String? _pendingImageRequestId;
 
   @override
   void dispose() {
+    final pendingImagePath = _pendingImageLocalPath;
+    if (pendingImagePath != null) {
+      unawaited(deleteSanitizedUploadTempFile(pendingImagePath));
+    }
     _messageController.dispose();
     super.dispose();
   }
@@ -50,18 +68,113 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   String _getTargetUid(Match match, String currentUid) =>
       match.userIds.firstWhere((id) => id != currentUid, orElse: () => '');
 
-  void _sendMessage(String text) {
-    if (text.trim().isEmpty) return;
-    ref
-        .read(sendMessageProvider((widget.matchId, text)).future)
-        .then((_) => _messageController.clear())
-        .catchError((e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('$e')));
-      }
+  Future<void> _sendMessage(String text) async {
+    final normalizedText = text.trim();
+    if (normalizedText.isEmpty || _isSendingMessage || _isSendingImage) return;
+
+    final requestId =
+        _pendingText == normalizedText && _pendingTextRequestId != null
+            ? _pendingTextRequestId!
+            : _uuid.v4();
+    setState(() {
+      _isSendingMessage = true;
+      _showIcebreakers = false;
+      _pendingText = normalizedText;
+      _pendingTextRequestId = requestId;
     });
-    setState(() => _showIcebreakers = false);
+
+    try {
+      await ref.read(chatRepositoryProvider).sendMessage(
+            widget.matchId,
+            normalizedText,
+            clientRequestId: requestId,
+          );
+      if (!mounted) return;
+      if (_messageController.text.trim() == normalizedText) {
+        _messageController.clear();
+      }
+      _pendingText = null;
+      _pendingTextRequestId = null;
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('메시지를 보내지 못했어요. 다시 시도해 주세요.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSendingMessage = false);
+    }
+  }
+
+  Future<void> _sendImage({bool retryPending = false}) async {
+    if (_isSendingMessage || _isSendingImage) return;
+
+    String? uploadPath;
+    var requestId = _pendingImageRequestId;
+    if (retryPending && requestId != null && _pendingImageLocalPath != null) {
+      uploadPath = _pendingImageLocalPath;
+    } else {
+      final selected = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 92,
+        maxWidth: 2200,
+      );
+      if (selected == null || !mounted) return;
+
+      uploadPath = await cropImageForUpload(
+        context,
+        sourcePath: selected.path,
+        preferSquare: false,
+      );
+      if (uploadPath == null) return;
+      if (!mounted) {
+        await deleteSanitizedUploadTempFile(uploadPath);
+        return;
+      }
+      final previousPendingPath = _pendingImageLocalPath;
+      if (previousPendingPath != null && previousPendingPath != uploadPath) {
+        await deleteSanitizedUploadTempFile(previousPendingPath);
+      }
+      requestId = _uuid.v4();
+      _pendingImageLocalPath = uploadPath;
+      _pendingImageRequestId = requestId;
+    }
+    final preparedPath = uploadPath;
+    if (preparedPath == null) {
+      throw StateError('Image retry state is incomplete');
+    }
+    final preparedRequestId = requestId;
+
+    var sent = false;
+    setState(() {
+      _isSendingImage = true;
+      _showIcebreakers = false;
+    });
+    try {
+      await ref.read(chatRepositoryProvider).sendImage(
+            widget.matchId,
+            preparedPath,
+            clientRequestId: preparedRequestId,
+          );
+      sent = true;
+      _pendingImageLocalPath = null;
+      _pendingImageRequestId = null;
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('사진을 보내지 못했어요. 다시 시도해 주세요.'),
+            action: SnackBarAction(
+              label: '다시 시도',
+              onPressed: () => _sendImage(retryPending: true),
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (sent) await deleteSanitizedUploadTempFile(preparedPath);
+      if (mounted) setState(() => _isSendingImage = false);
+    }
   }
 
   void _showRandomQuestion() {
@@ -75,7 +188,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Widget build(BuildContext context) {
     final messagesAsync = ref.watch(chatMessagesProvider(widget.matchId));
     final matchAsync = ref.watch(matchProvider(widget.matchId));
-    final currentUser = FirebaseAuth.instance.currentUser;
+    final currentUser = ref.watch(authStateProvider).asData?.value;
 
     final match = matchAsync.asData?.value;
     final targetUid = match != null && currentUser != null
@@ -109,10 +222,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   reverse: true,
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
                   itemCount: msgs.length,
-                  itemBuilder: (_, i) => _MessageBubble(
-                    message: msgs[i],
-                    isCurrentUser: msgs[i].senderId == currentUser?.uid,
-                  ),
+                  itemBuilder: (_, i) {
+                    final message = msgs[i];
+                    final isCurrentUser = message.senderId == currentUser?.uid;
+                    if (message.isImage) {
+                      return _ImageMessageBubble(
+                        message: message,
+                        isCurrentUser: isCurrentUser,
+                      );
+                    }
+                    return _MessageBubble(
+                      message: message,
+                      isCurrentUser: isCurrentUser,
+                    );
+                  },
                 );
               },
               loading: () => const Center(child: CircularProgressIndicator()),
@@ -122,7 +245,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           _InputBar(
             controller: _messageController,
             onSend: _sendMessage,
+            onPickImage: () => _sendImage(),
             onRandomQuestion: _showRandomQuestion,
+            isSending: _isSendingMessage || _isSendingImage,
           ),
         ],
       ),
@@ -399,6 +524,69 @@ class _MessageBubbleState extends State<_MessageBubble> {
   }
 }
 
+class _ImageMessageBubble extends StatelessWidget {
+  const _ImageMessageBubble({
+    required this.message,
+    required this.isCurrentUser,
+  });
+
+  final ChatMessage message;
+  final bool isCurrentUser;
+
+  @override
+  Widget build(BuildContext context) {
+    final reference = message.imageReference;
+    final fallbackLabel = message.mediaDeleted ? '삭제된 사진입니다' : '사진을 불러오지 못했어요';
+
+    return Align(
+      alignment: isCurrentUser ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        width: 230,
+        height: reference.isEmpty ? 180 : 230,
+        margin: EdgeInsets.only(
+          left: isCurrentUser ? 56 : 0,
+          right: isCurrentUser ? 0 : 56,
+          bottom: 12,
+        ),
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          color: AppTheme.surface,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: AppTheme.divider),
+        ),
+        child: reference.isEmpty
+            ? Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    fallbackLabel,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: AppTheme.textSecondary),
+                  ),
+                ),
+              )
+            : AuthenticatedStorageImage(
+                reference: reference,
+                legacyUrl: message.imageUrl,
+                width: 230,
+                height: 230,
+                fit: BoxFit.cover,
+                errorWidget: const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(16),
+                    child: Text(
+                      '사진을 불러오지 못했어요',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: AppTheme.textSecondary),
+                    ),
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+}
+
 // ── 아이스브레이커 ─────────────────────────────────────────
 class _IcebreakersView extends StatelessWidget {
   final Function(String) onSelect;
@@ -479,12 +667,16 @@ class _IcebreakersView extends StatelessWidget {
 class _InputBar extends StatelessWidget {
   final TextEditingController controller;
   final Function(String) onSend;
+  final VoidCallback onPickImage;
   final VoidCallback onRandomQuestion;
+  final bool isSending;
 
   const _InputBar({
     required this.controller,
     required this.onSend,
+    required this.onPickImage,
     required this.onRandomQuestion,
+    required this.isSending,
   });
 
   @override
@@ -499,9 +691,9 @@ class _InputBar extends StatelessWidget {
         top: false,
         child: Row(
           children: [
-            // 랜덤 질문 버튼
             GestureDetector(
-              onTap: onRandomQuestion,
+              key: const ValueKey('chat_image_button'),
+              onTap: isSending ? null : onPickImage,
               child: Container(
                 width: 38,
                 height: 38,
@@ -509,8 +701,25 @@ class _InputBar extends StatelessWidget {
                   color: AppTheme.surface,
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: const Icon(Icons.casino_outlined,
+                child: const Icon(Icons.photo_outlined,
                     color: AppTheme.primary, size: 18),
+              ),
+            ),
+            const SizedBox(width: 6),
+            GestureDetector(
+              onTap: isSending ? null : onRandomQuestion,
+              child: Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: AppTheme.surface,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(
+                  Icons.casino_outlined,
+                  color: AppTheme.primary,
+                  size: 18,
+                ),
               ),
             ),
             const SizedBox(width: 8),
@@ -518,6 +727,14 @@ class _InputBar extends StatelessWidget {
               child: TextField(
                 controller: controller,
                 maxLines: null,
+                maxLength: 1000,
+                buildCounter: (
+                  _, {
+                  required currentLength,
+                  required isFocused,
+                  required maxLength,
+                }) =>
+                    null,
                 textInputAction: TextInputAction.send,
                 onSubmitted: onSend,
                 decoration: InputDecoration(
@@ -535,7 +752,7 @@ class _InputBar extends StatelessWidget {
             ),
             const SizedBox(width: 8),
             GestureDetector(
-              onTap: () => onSend(controller.text),
+              onTap: isSending ? null : () => onSend(controller.text),
               child: Container(
                 width: 38,
                 height: 38,
@@ -543,7 +760,15 @@ class _InputBar extends StatelessWidget {
                   color: AppTheme.primary,
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: const Icon(Icons.send, color: Colors.white, size: 17),
+                child: isSending
+                    ? const Padding(
+                        padding: EdgeInsets.all(10),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Icon(Icons.send, color: Colors.white, size: 17),
               ),
             ),
           ],

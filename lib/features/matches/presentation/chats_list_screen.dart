@@ -10,6 +10,7 @@ import '../../../core/widgets/bottom_nav_bar.dart';
 import '../../../core/widgets/nationality_badge.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../../core/i18n/ui_text.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 
 class ChatsListScreen extends ConsumerWidget {
   const ChatsListScreen({super.key});
@@ -349,10 +350,21 @@ class _ChatItem extends StatelessWidget {
           children: [
             // Profile photo.
             if (photoUrl.isNotEmpty)
-              CircleAvatar(
-                radius: 26,
-                backgroundColor: AppTheme.surface,
-                backgroundImage: NetworkImage(photoUrl),
+              ClipOval(
+                child: SizedBox.square(
+                  dimension: 52,
+                  child: AuthenticatedStorageImage(
+                    reference: photoUrl,
+                    placeholder: DefaultAvatar(
+                      nationality: otherNationality,
+                      gender: match.partnerGender(currentUid),
+                    ),
+                    errorWidget: DefaultAvatar(
+                      nationality: otherNationality,
+                      gender: match.partnerGender(currentUid),
+                    ),
+                  ),
+                ),
               )
             else
               DefaultAvatarCircle(

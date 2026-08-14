@@ -1,10 +1,10 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../app/theme/app_theme.dart';
 import '../../../core/i18n/ui_text.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 import '../../../core/widgets/bottom_nav_bar.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../../core/widgets/nationality_badge.dart';
@@ -312,8 +312,13 @@ class _CandidateListState extends State<_CandidateList> {
 
     final candidates = state.filteredCandidates;
 
+    if (state.error != null && state.candidates.isEmpty) {
+      return _DiscoveryErrorView(onRetry: notifier.refresh);
+    }
+
     if (candidates.isEmpty) {
       return Center(
+        key: const ValueKey('discovery_empty_state'),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -342,31 +347,140 @@ class _CandidateListState extends State<_CandidateList> {
       );
     }
 
-    return NotificationListener<ScrollNotification>(
-      onNotification: _onScroll,
-      child: RefreshIndicator(
-        onRefresh: notifier.refresh,
-        color: AppTheme.primary,
-        child: ListView.separated(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
-          itemCount: candidates.length +
-              (state.isLoading || state.isLoadingMore ? 1 : 0),
-          separatorBuilder: (_, __) => const SizedBox(height: 12),
-          itemBuilder: (context, i) {
-            if (i == candidates.length) {
-              return const Padding(
-                padding: EdgeInsets.symmetric(vertical: 20),
-                child: Center(
-                  child: CircularProgressIndicator(color: AppTheme.primary),
+    return Column(
+      children: [
+        if (state.error != null)
+          _DiscoveryErrorBanner(onRetry: notifier.refresh),
+        Expanded(
+          child: NotificationListener<ScrollNotification>(
+            onNotification: _onScroll,
+            child: RefreshIndicator(
+              onRefresh: notifier.refresh,
+              color: AppTheme.primary,
+              child: ListView.separated(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
+                itemCount: candidates.length +
+                    (state.isLoading || state.isLoadingMore ? 1 : 0),
+                separatorBuilder: (_, __) => const SizedBox(height: 12),
+                itemBuilder: (context, i) {
+                  if (i == candidates.length) {
+                    return const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 20),
+                      child: Center(
+                        child: CircularProgressIndicator(
+                          color: AppTheme.primary,
+                        ),
+                      ),
+                    );
+                  }
+                  final candidate = candidates[i];
+                  return _CandidateCard(
+                    profile: candidate,
+                    onTap: () =>
+                        context.push('/profile/detail/${candidate.uid}'),
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _DiscoveryErrorView extends StatelessWidget {
+  const _DiscoveryErrorView({required this.onRetry});
+
+  final Future<void> Function() onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      key: const ValueKey('discovery_error_state'),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(
+              Icons.cloud_off_rounded,
+              size: 48,
+              color: AppTheme.textSecondary,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              context.t(
+                '사람들을 불러오지 못했어요',
+                'ユーザーを読み込めませんでした',
+              ),
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              context.t(
+                '잠시 후 다시 시도해 주세요',
+                'しばらくしてからもう一度お試しください',
+              ),
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 24),
+            FilledButton.icon(
+              key: const ValueKey('discovery_error_retry'),
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh_rounded),
+              label: Text(context.t('다시 시도', '再試行')),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _DiscoveryErrorBanner extends StatelessWidget {
+  const _DiscoveryErrorBanner({required this.onRetry});
+
+  final Future<void> Function() onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      key: const ValueKey('discovery_error_banner'),
+      color: AppTheme.surface,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.info_outline_rounded,
+              size: 20,
+              color: AppTheme.textSecondary,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                context.t(
+                  '최신 프로필로 갱신하지 못했어요',
+                  '最新のプロフィールに更新できませんでした',
                 ),
-              );
-            }
-            final candidate = candidates[i];
-            return _CandidateCard(
-              profile: candidate,
-              onTap: () => context.push('/profile/detail/${candidate.uid}'),
-            );
-          },
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: AppTheme.textSecondary,
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: onRetry,
+              child: Text(context.t('다시 시도', '再試行')),
+            ),
+          ],
         ),
       ),
     );
@@ -611,16 +725,16 @@ class _ProfilePhoto extends StatelessWidget {
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(14),
-      child: CachedNetworkImage(
-        imageUrl: photoUrls.first,
+      child: AuthenticatedStorageImage(
+        reference: photoUrls.first,
         width: 94,
         height: 124,
         fit: BoxFit.cover,
-        placeholder: (_, __) => DefaultAvatar(
+        placeholder: DefaultAvatar(
           nationality: nationality,
           gender: gender,
         ),
-        errorWidget: (_, __, ___) => DefaultAvatar(
+        errorWidget: DefaultAvatar(
           nationality: nationality,
           gender: gender,
         ),

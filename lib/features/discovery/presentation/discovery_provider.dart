@@ -1,5 +1,5 @@
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../app/config/app_config.dart';
 import '../data/discovery_repository_impl.dart';
 import '../data/mock_candidates.dart';
 import '../domain/discovery_repository.dart';
@@ -22,7 +22,9 @@ class DiscoveryNotifier extends Notifier<DiscoveryState> {
     _repository = ref.watch(discoveryRepositoryProvider);
     Future.microtask(_loadCandidates);
     return DiscoveryState(
-      candidates: List<PublicProfile>.from(mockCandidates),
+      candidates: AppConfig.allowMockData
+          ? List<PublicProfile>.from(mockCandidates)
+          : const [],
     );
   }
 
@@ -33,24 +35,21 @@ class DiscoveryNotifier extends Notifier<DiscoveryState> {
     state = state.copyWith(isLoading: showSpinner || !hasCandidates);
 
     try {
-      final users = await _repository
-          .fetchUsers(reset: true)
-          .timeout(const Duration(seconds: 8));
+      final users = await _repository.fetchUsers(reset: true);
       final hasMore = _repository.hasMore;
-      final finalCandidates =
-          users.isEmpty ? List<PublicProfile>.from(mockCandidates) : users;
+      final finalCandidates = users.isEmpty && AppConfig.allowMockData
+          ? List<PublicProfile>.from(mockCandidates)
+          : users;
       state = state.copyWith(
         candidates: finalCandidates,
         isLoading: false,
         hasMore: hasMore,
+        clearError: true,
       );
     } catch (_) {
       state = state.copyWith(
-        candidates: hasCandidates
-            ? state.candidates
-            : List<PublicProfile>.from(mockCandidates),
         isLoading: false,
-        hasMore: false,
+        error: 'discovery-load-failed',
       );
     }
   }
@@ -60,17 +59,19 @@ class DiscoveryNotifier extends Notifier<DiscoveryState> {
     state = state.copyWith(isLoadingMore: true);
 
     try {
-      final users = await _repository
-          .fetchUsers(reset: false)
-          .timeout(const Duration(seconds: 8));
+      final users = await _repository.fetchUsers(reset: false);
       final hasMore = _repository.hasMore;
       state = state.copyWith(
         candidates: [...state.candidates, ...users],
         isLoadingMore: false,
         hasMore: hasMore,
+        clearError: true,
       );
     } catch (_) {
-      state = state.copyWith(isLoadingMore: false);
+      state = state.copyWith(
+        isLoadingMore: false,
+        error: 'discovery-load-more-failed',
+      );
     }
   }
 
@@ -102,35 +103,36 @@ class DiscoveryNotifier extends Notifier<DiscoveryState> {
     }
   }
 
-  Future<void> passUser(String targetUid) async {
-    state = state.copyWith(
-      candidates: state.candidates.where((c) => c.uid != targetUid).toList(),
-    );
-
+  Future<bool> passUser(String targetUid) async {
     try {
       await _repository.passUser(targetUid);
+      state = state.copyWith(
+        candidates: state.candidates.where((c) => c.uid != targetUid).toList(),
+      );
       if (state.candidates.isEmpty) {
         await _loadCandidates();
       }
+      return true;
     } catch (e) {
       state = state.copyWith(error: e.toString());
+      return false;
     }
   }
 
-  /// 반환값: matchId 또는 null
-  /// FirebaseFunctionsException code=='resource-exhausted' → 열쇠 부족
-  Future<String?> startDirectChat(String targetUid) async {
-    try {
-      return await _repository.startDirectChat(targetUid);
-    } on FirebaseFunctionsException catch (e) {
-      if (e.code == 'resource-exhausted') rethrow;
-      state = state.copyWith(error: e.message ?? e.toString());
-      return null;
-    } catch (e) {
-      state = state.copyWith(error: e.toString());
-      return null;
-    }
+  Future<void> submitRating({
+    required String ratedUid,
+    required int stars,
+    required List<String> tags,
+  }) {
+    return _repository.submitRating(
+      ratedUid: ratedUid,
+      stars: stars,
+      tags: tags,
+    );
   }
+
+  Future<String> startDirectChat(String targetUid) =>
+      _repository.startDirectChat(targetUid);
 
   void clearMatch() {
     state = state.copyWith(clearMatch: true);
@@ -146,6 +148,7 @@ class DiscoveryNotifier extends Notifier<DiscoveryState> {
     try {
       return state.candidates.firstWhere((c) => c.uid == uid);
     } catch (_) {
+      if (!AppConfig.allowMockData) return null;
       try {
         return mockCandidates.firstWhere((c) => c.uid == uid);
       } catch (_) {

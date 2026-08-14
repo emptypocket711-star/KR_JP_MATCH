@@ -1,5 +1,19 @@
 import 'candidate.dart';
 
+class ProfileDetailResult {
+  const ProfileDetailResult({
+    required this.profile,
+    required this.isOwnProfile,
+    required this.hasActiveChat,
+    required this.hasAlreadyRated,
+  });
+
+  final PublicProfile profile;
+  final bool isOwnProfile;
+  final bool hasActiveChat;
+  final bool hasAlreadyRated;
+}
+
 abstract class DiscoveryRepository {
   /// 반대 국적 유저를 페이지 단위로 조회. reset=true 면 첫 페이지부터 다시 로드.
   Future<List<PublicProfile>> fetchUsers({bool reset = false});
@@ -13,6 +27,14 @@ abstract class DiscoveryRepository {
   Future<Map<String, dynamic>> likeUser(String targetUid);
 
   Future<Map<String, dynamic>> passUser(String targetUid);
+
+  Future<ProfileDetailResult> getProfileDetail(String targetUid);
+
+  Future<void> submitRating({
+    required String ratedUid,
+    required int stars,
+    required List<String> tags,
+  });
 
   /// 상대방과 즉시 1:1 채팅방 생성 — 매칭 없이도 가능. matchId 반환.
   Future<String> startDirectChat(String targetUid);

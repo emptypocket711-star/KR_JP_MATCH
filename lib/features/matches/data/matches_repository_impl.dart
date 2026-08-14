@@ -11,6 +11,7 @@ class MatchesRepositoryImpl implements MatchesRepository {
         .collection('matches')
         .where('userIds', arrayContains: currentUid)
         .where('isActive', isEqualTo: true)
+        .where('directRoomVersion', isEqualTo: 1)
         .snapshots()
         .map((snapshot) {
       final list = snapshot.docs

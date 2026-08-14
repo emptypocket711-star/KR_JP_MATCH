@@ -1,15 +1,15 @@
-import 'package:cached_network_image/cached_network_image.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../discovery/domain/candidate.dart';
 import '../../discovery/presentation/discovery_provider.dart';
 import '../../../app/theme/app_theme.dart';
+import '../../../core/media/authenticated_storage_image.dart';
 import '../../../core/widgets/nationality_badge.dart';
 import '../../../core/widgets/default_avatar.dart';
 import '../../../core/widgets/user_name_text.dart';
+import '../../paywall/presentation/low_key_sheet.dart';
 import 'rating_bottom_sheet.dart';
 
 class ProfileDetailScreen extends ConsumerStatefulWidget {
@@ -26,8 +26,10 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
   final _pageController = PageController();
   bool _isStartingChat = false;
   PublicProfile? _loadedProfile;
-  bool _isLoadingProfile = false;
-  bool _hasChatHistory = false;
+  bool _isLoadingProfile = true;
+  bool _profileRequestInFlight = false;
+  bool _isOwnProfile = false;
+  bool _hasActiveChat = false;
   bool _hasAlreadyRated = false;
 
   @override
@@ -36,76 +38,86 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadLiveData());
   }
 
-  Future<void> _loadLiveData() async {
-    if (_isLoadingProfile) return;
-    setState(() => _isLoadingProfile = true);
-    final currentUid = FirebaseAuth.instance.currentUser?.uid;
-    try {
-      final matchId = currentUid != null
-          ? ([currentUid, widget.uid]..sort()).join('_')
-          : null;
-      final ratingId =
-          currentUid != null ? '${currentUid}_${widget.uid}' : null;
-
-      final futures = <Future>[
-        FirebaseFirestore.instance.collection('users').doc(widget.uid).get(),
-        if (matchId != null)
-          FirebaseFirestore.instance.collection('matches').doc(matchId).get(),
-        if (ratingId != null)
-          FirebaseFirestore.instance.collection('ratings').doc(ratingId).get(),
-      ];
-      final results = await Future.wait(futures);
-      if (!mounted) return;
-
-      final doc = results[0] as DocumentSnapshot;
-      if (doc.exists) {
-        final data = Map<String, dynamic>.from(doc.data()! as Map);
-        data['uid'] = doc.id;
-        final hasMatch =
-            results.length > 1 && (results[1] as DocumentSnapshot).exists;
-        final hasRated =
-            results.length > 2 && (results[2] as DocumentSnapshot).exists;
-        setState(() {
-          _loadedProfile = PublicProfile.fromMap(data);
-          _isLoadingProfile = false;
-          _hasChatHistory = hasMatch;
-          _hasAlreadyRated = hasRated;
-        });
-      } else {
-        setState(() => _isLoadingProfile = false);
-      }
-    } catch (_) {
-      if (mounted) setState(() => _isLoadingProfile = false);
-    }
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
   }
 
-  bool get _isOwnProfile =>
-      widget.uid == FirebaseAuth.instance.currentUser?.uid;
+  Future<void> _loadLiveData() async {
+    if (_profileRequestInFlight) return;
+    _profileRequestInFlight = true;
+    if (!_isLoadingProfile) setState(() => _isLoadingProfile = true);
+    try {
+      final detail = await ref
+          .read(discoveryRepositoryProvider)
+          .getProfileDetail(widget.uid);
+      if (!mounted) return;
+      setState(() {
+        _loadedProfile = detail.profile;
+        _isLoadingProfile = false;
+        _isOwnProfile = detail.isOwnProfile;
+        _hasActiveChat = detail.hasActiveChat;
+        _hasAlreadyRated = detail.hasAlreadyRated;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _isLoadingProfile = false);
+    } finally {
+      _profileRequestInFlight = false;
+    }
+  }
 
   Future<void> _startChat() async {
     if (_isStartingChat) return;
     setState(() => _isStartingChat = true);
 
     final notifier = ref.read(discoveryStateProvider.notifier);
-    final matchId = await notifier.startDirectChat(widget.uid);
+    String? matchId;
+    FirebaseFunctionsException? callableError;
+    Object? otherError;
+    try {
+      matchId = await notifier.startDirectChat(widget.uid);
+    } on FirebaseFunctionsException catch (error) {
+      callableError = error;
+    } catch (error) {
+      otherError = error;
+    } finally {
+      if (mounted) setState(() => _isStartingChat = false);
+    }
 
     if (!mounted) return;
-    setState(() => _isStartingChat = false);
-
     if (matchId != null) {
       context.push('/chat/$matchId');
-    } else {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('채팅방 생성에 실패했어요.')));
+      return;
     }
+    if (callableError?.code == 'resource-exhausted') {
+      await LowKeySheet.show(context);
+      return;
+    }
+    if (callableError != null || otherError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('채팅방을 열지 못했어요. 다시 시도해 주세요.')),
+      );
+    }
+  }
+
+  Future<void> _passUser() async {
+    final passed =
+        await ref.read(discoveryStateProvider.notifier).passUser(widget.uid);
+    if (!mounted) return;
+    if (passed) {
+      context.pop();
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('나중에 다시 시도해 주세요.')),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final notifier = ref.read(discoveryStateProvider.notifier);
-    // Prefer live Firestore data (_loadedProfile) for accurate stats;
-    // fall back to discovery cache for immediate first-render.
-    final profile = _loadedProfile ?? notifier.findCandidate(widget.uid);
+    final profile = _loadedProfile;
 
     if (profile == null) {
       return Scaffold(
@@ -158,14 +170,16 @@ class _ProfileDetailScreenState extends ConsumerState<ProfileDetailScreen> {
               profile: profile,
               isStartingChat: _isStartingChat,
               isOwnProfile: _isOwnProfile,
-              hasChatHistory: _hasChatHistory,
+              hasChatHistory: _hasActiveChat,
               hasAlreadyRated: _hasAlreadyRated,
               scrollController: scrollController,
-              onPass: () {
-                notifier.passUser(widget.uid);
-                context.pop();
-              },
+              onPass: _passUser,
               onStartChat: _startChat,
+              onSubmitRating: (stars, tags) => notifier.submitRating(
+                ratedUid: profile.uid,
+                stars: stars,
+                tags: tags,
+              ),
               onRatingSubmitted: () {
                 setState(() => _hasAlreadyRated = true);
                 _loadLiveData();
@@ -264,10 +278,10 @@ class _PhotoItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox.expand(
-      child: CachedNetworkImage(
-        imageUrl: url,
+      child: AuthenticatedStorageImage(
+        reference: url,
         fit: BoxFit.cover,
-        errorWidget: (_, __, ___) => Image.asset(
+        errorWidget: Image.asset(
           defaultAvatarAsset(nationality: nationality, gender: gender),
           fit: BoxFit.cover,
         ),
@@ -364,13 +378,13 @@ class _NetworkFullscreenViewerState extends State<_NetworkFullscreenViewer> {
               onPageChanged: (i) => setState(() => _current = i),
               itemBuilder: (_, i) => InteractiveViewer(
                 child: Center(
-                  child: CachedNetworkImage(
-                    imageUrl: widget.photoUrls[i],
+                  child: AuthenticatedStorageImage(
+                    reference: widget.photoUrls[i],
                     fit: BoxFit.contain,
-                    placeholder: (_, __) => const Center(
+                    placeholder: const Center(
                         child:
                             CircularProgressIndicator(color: Colors.white54)),
-                    errorWidget: (_, __, ___) => const Center(
+                    errorWidget: const Center(
                         child: Icon(Icons.broken_image_outlined,
                             color: Colors.white54)),
                   ),
@@ -525,6 +539,7 @@ class _InfoPanel extends StatelessWidget {
   final ScrollController scrollController;
   final VoidCallback onPass;
   final VoidCallback onStartChat;
+  final Future<void> Function(int stars, List<String> tags) onSubmitRating;
   final VoidCallback onRatingSubmitted;
 
   const _InfoPanel({
@@ -536,6 +551,7 @@ class _InfoPanel extends StatelessWidget {
     required this.scrollController,
     required this.onPass,
     required this.onStartChat,
+    required this.onSubmitRating,
     required this.onRatingSubmitted,
   });
 
@@ -831,8 +847,8 @@ class _InfoPanel extends StatelessWidget {
                                   isScrollControlled: true,
                                   backgroundColor: Colors.transparent,
                                   builder: (_) => RatingBottomSheet(
-                                    ratedUid: profile.uid,
                                     ratedName: profile.displayName,
+                                    onSubmit: onSubmitRating,
                                     onSubmitted: onRatingSubmitted,
                                   ),
                                 );

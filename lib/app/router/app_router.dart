@@ -4,10 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../features/auth/presentation/login_screen.dart';
 import '../../features/onboarding/presentation/onboarding_screen.dart';
 import '../../features/discovery/presentation/discovery_screen.dart';
-import '../../features/matches/presentation/matches_screen.dart';
 import '../../features/matches/presentation/chats_list_screen.dart';
 import '../../features/chat/presentation/chat_screen.dart';
-import '../../features/profile/presentation/profile_screen.dart';
 import '../../features/profile/presentation/profile_edit_screen.dart';
 import '../../features/profile/presentation/profile_detail_screen.dart';
 import '../../features/lounge/presentation/lounge_screen.dart';
@@ -19,10 +17,53 @@ import '../../features/splash/presentation/splash_screen.dart';
 import '../../features/auth/presentation/auth_provider.dart';
 import '../../features/paywall/presentation/paywall_screen.dart';
 
+@visibleForTesting
+const legacyMainTabRedirects = <String, String>{
+  '/matches': '/chats',
+  '/profile': '/settings',
+};
+
+@visibleForTesting
+String? profileAccessRedirect({
+  required ProfileAccessState accessState,
+  required String location,
+}) {
+  switch (accessState) {
+    case ProfileAccessState.loading:
+      return location == '/splash' ? null : '/splash';
+    case ProfileAccessState.incomplete:
+      return location == '/onboarding' ? null : '/onboarding';
+    case ProfileAccessState.remediation:
+      // A completed legacy profile must use updateMyProfile: completeOnboarding
+      // can reject profiles that are usable but still miss newer public fields.
+      // Settings stays reachable so the user can safely log out or switch
+      // accounts without gaining access to protected app surfaces.
+      return location == '/profile/edit' || location == '/settings'
+          ? null
+          : '/profile/edit';
+    case ProfileAccessState.active:
+      if (location == '/splash' ||
+          location == '/login' ||
+          location == '/onboarding' ||
+          location == '/account-disabled' ||
+          location == '/profile-access-error' ||
+          location == '/') {
+        return '/discovery';
+      }
+      return null;
+    case ProfileAccessState.disabled:
+      return location == '/account-disabled' ? null : '/account-disabled';
+    case ProfileAccessState.error:
+      return location == '/profile-access-error'
+          ? null
+          : '/profile-access-error';
+  }
+}
+
 class _AuthChangeNotifier extends ChangeNotifier {
   _AuthChangeNotifier(Ref ref) {
     ref.listen(authStateProvider, (_, __) => notifyListeners());
-    ref.listen(profileExistsProvider, (_, __) => notifyListeners());
+    ref.listen(profileAccessProvider, (_, __) => notifyListeners());
   }
 }
 
@@ -47,26 +88,11 @@ final appRouterProvider = Provider<GoRouter>((ref) {
       }
 
       // 프로필 조회 중 → splash 대기
-      final profileState = ref.read(profileExistsProvider);
-      if (profileState.isLoading) {
-        return loc == '/splash' ? null : '/splash';
-      }
-
-      // 프로필 미완성 유저 → 온보딩
-      final profileExists = profileState.asData?.value ?? false;
-      if (!profileExists) {
-        return loc == '/onboarding' ? null : '/onboarding';
-      }
-
-      // 인증됨 — 인증 전용 화면에서 벗어남
-      if (loc == '/splash' ||
-          loc == '/login' ||
-          loc == '/onboarding' ||
-          loc == '/') {
-        return '/discovery';
-      }
-
-      return null;
+      final profileState = ref.read(profileAccessProvider);
+      return profileAccessRedirect(
+        accessState: resolvedProfileAccessState(profileState),
+        location: loc,
+      );
     },
     routes: [
       GoRoute(
@@ -80,6 +106,18 @@ final appRouterProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: '/onboarding',
         builder: (context, state) => const OnboardingScreen(),
+      ),
+      GoRoute(
+        path: '/account-disabled',
+        builder: (context, state) => const _ProfileAccessGateScreen(
+          isDisabled: true,
+        ),
+      ),
+      GoRoute(
+        path: '/profile-access-error',
+        builder: (context, state) => const _ProfileAccessGateScreen(
+          isDisabled: false,
+        ),
       ),
       GoRoute(
         path: '/discovery',
@@ -102,7 +140,7 @@ final appRouterProvider = Provider<GoRouter>((ref) {
       ),
       GoRoute(
         path: '/matches',
-        builder: (context, state) => const MatchesScreen(),
+        redirect: (context, state) => legacyMainTabRedirects['/matches'],
       ),
       GoRoute(
         path: '/chats',
@@ -117,7 +155,7 @@ final appRouterProvider = Provider<GoRouter>((ref) {
       ),
       GoRoute(
         path: '/profile',
-        builder: (context, state) => const ProfileScreen(),
+        redirect: (context, state) => legacyMainTabRedirects['/profile'],
       ),
       GoRoute(
         path: '/profile/edit',
@@ -160,3 +198,47 @@ final appRouterProvider = Provider<GoRouter>((ref) {
 
   return router;
 });
+
+class _ProfileAccessGateScreen extends ConsumerWidget {
+  const _ProfileAccessGateScreen({required this.isDisabled});
+
+  final bool isDisabled;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Hana')),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                isDisabled ? Icons.block_outlined : Icons.cloud_off_outlined,
+                size: 48,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                isDisabled ? '현재 사용할 수 없는 계정입니다.' : '계정 상태를 확인하지 못했어요.',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 20),
+              if (isDisabled)
+                FilledButton(
+                  onPressed: () => ref.read(authRepositoryProvider).signOut(),
+                  child: const Text('로그아웃'),
+                )
+              else
+                FilledButton(
+                  onPressed: () => ref.invalidate(profileAccessProvider),
+                  child: const Text('다시 시도'),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
