@@ -139,6 +139,7 @@ import {
 import { verifyGooglePlayProductPurchase } from './playBillingVerifier';
 import {
   fcmTokenOwnershipId,
+  retryableFcmRegistrationDetails,
   shouldClearOwnedFcmToken,
 } from './fcmTokenPolicy';
 import {
@@ -2213,7 +2214,9 @@ const allowedMessageReactions = ['❤️', '😂', '👍', '😮', '😢', '🙏
  * updateFcmToken(data: { token: string }) -> { ok: true }
  *
  * Stores the current device FCM token through a server-owned path so clients do
- * not directly write notification credentials to the public user document.
+ * not directly write notification credentials to the public user document. A
+ * first-session caller whose profile is not ready receives a retryable,
+ * minimal failed-precondition response instead of a false success.
  */
 export const updateFcmToken = regionalFunctions.https.onCall(
   async (data: any, context: functions.https.CallableContext) => {
@@ -2240,7 +2243,14 @@ export const updateFcmToken = regionalFunctions.https.onCall(
         exists: userSnap.exists,
         userData: userSnap.data(),
       });
-      if (accountIssue === 'missing') return;
+      const retryDetails = retryableFcmRegistrationDetails(accountIssue);
+      if (retryDetails != null) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Notification registration is not ready',
+          retryDetails
+        );
+      }
       if (accountIssue === 'banned') {
         throw new functions.https.HttpsError('permission-denied', 'User is banned');
       }
