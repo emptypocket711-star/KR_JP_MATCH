@@ -5,9 +5,12 @@ import { Translate } from '@google-cloud/translate/build/src/v2';
 import { createAccountDeletionProcessor } from './accountDeletionWorker';
 import { buildScopedAgoraRtcToken } from './agoraRtcToken';
 import {
+  activePairRoomIdsForSafety,
   decideCloseActiveChatPolicy,
   decideStartChatPolicy,
+  isReusableDirectRoom,
   isExactDirectChatParticipants,
+  MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION,
 } from './chatPolicy';
 import {
   idempotentMessageDocumentId,
@@ -65,7 +68,6 @@ import {
   shouldQuarantineMediaCleanup,
 } from './mediaCleanupPolicy';
 import {
-  canApplyMessageSideEffects,
   shouldSendChatPush,
   targetLanguagesForMessage,
   translatedPreviewForRecipient,
@@ -161,9 +163,7 @@ import {
 } from './fcmTokenPolicy';
 import {
   buildReportContentEvidence,
-  canUseRequestedMatchForSafety,
   clientReportIntakeDecision,
-  closedChatHiddenParticipants,
   isValidReportReason,
   normalizeReportContentContext,
   ReportContentContext,
@@ -911,38 +911,198 @@ function assertNoAccountDeletionJob(
   }
 }
 
+function directRoomUnavailable(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'permission-denied',
+    'Chat room is unavailable'
+  );
+}
+
+function directChatTargetUnavailable(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'permission-denied',
+    'Target user is unavailable'
+  );
+}
+
+function reusableDirectRoomSnapshots(params: {
+  matchId: string;
+  matchSnap: FirebaseFirestore.DocumentSnapshot;
+  pairSnap: FirebaseFirestore.DocumentSnapshot;
+  expectedUserIds: readonly string[];
+  pairKey: string;
+}): boolean {
+  const matchData = params.matchSnap.data();
+  const pairData = params.pairSnap.data();
+  return isReusableDirectRoom({
+    matchId: params.matchId,
+    matchExists: params.matchSnap.exists,
+    matchActive: matchData?.isActive === true,
+    matchUserIds: matchData?.userIds,
+    matchPairKey: matchData?.pairKey,
+    directRoomVersion: matchData?.directRoomVersion,
+    hiddenFor: matchData?.hiddenFor,
+    expectedUserIds: params.expectedUserIds,
+    pointerExists: params.pairSnap.exists,
+    pointerId: params.pairSnap.id,
+    pointerUserIds: pairData?.userIds,
+    pointerPairKey: pairData?.pairKey,
+    pointerActiveMatchId: pairData?.activeMatchId,
+    pointerClosedMatchId: pairData?.closedMatchId,
+    pointerClosedReason: pairData?.closedReason,
+  }) && params.pairSnap.id === params.pairKey;
+}
+
+interface DirectRoomSideEffectContext {
+  senderData: FirebaseFirestore.DocumentData;
+  recipientData: FirebaseFirestore.DocumentData;
+}
+
+async function readAuthorizedDirectRoomSideEffectContextInTransaction(
+  tx: FirebaseFirestore.Transaction,
+  params: {
+    matchId: string;
+    senderUid: string;
+    recipientUid: string;
+  }
+): Promise<DirectRoomSideEffectContext | null> {
+  const expectedUserIds = [params.senderUid, params.recipientUid].sort();
+  const pairKey = expectedUserIds.join('_');
+  const matchRef = db.collection('matches').doc(params.matchId);
+  const pairRef = db.collection('chatPairs').doc(pairKey);
+  const senderRef = db.collection('users').doc(params.senderUid);
+  const recipientRef = db.collection('users').doc(params.recipientUid);
+  const [
+    matchSnap,
+    pairSnap,
+    senderSnap,
+    recipientSnap,
+    senderBlockSnap,
+    recipientBlockSnap,
+  ] = await Promise.all([
+    tx.get(matchRef),
+    tx.get(pairRef),
+    tx.get(senderRef),
+    tx.get(recipientRef),
+    tx.get(senderRef.collection('blocks').doc(params.recipientUid)),
+    tx.get(recipientRef.collection('blocks').doc(params.senderUid)),
+  ]);
+  if (
+    activeAccountIssue({
+      exists: senderSnap.exists,
+      userData: senderSnap.data(),
+    }) !== null ||
+    activeAccountIssue({
+      exists: recipientSnap.exists,
+      userData: recipientSnap.data(),
+    }) !== null ||
+    senderBlockSnap.exists ||
+    recipientBlockSnap.exists ||
+    !reusableDirectRoomSnapshots({
+      matchId: params.matchId,
+      matchSnap,
+      pairSnap,
+      expectedUserIds,
+      pairKey,
+    })
+  ) {
+    return null;
+  }
+  return {
+    senderData: senderSnap.data()!,
+    recipientData: recipientSnap.data()!,
+  };
+}
+
+async function readAuthorizedDirectRoomSideEffectContext(params: {
+  matchId: string;
+  senderUid: string;
+  recipientUid: string;
+}): Promise<DirectRoomSideEffectContext | null> {
+  return db.runTransaction((tx) =>
+    readAuthorizedDirectRoomSideEffectContextInTransaction(tx, params)
+  );
+}
+
+async function applyAuthorizedMessageRecipientState(params: {
+  matchId: string;
+  senderUid: string;
+  recipientUid: string;
+  localizedPreview: string | null;
+}): Promise<DirectRoomSideEffectContext | null> {
+  return db.runTransaction(async (tx) => {
+    const access = await readAuthorizedDirectRoomSideEffectContextInTransaction(
+      tx,
+      params
+    );
+    if (access == null) return null;
+    tx.update(db.collection('matches').doc(params.matchId), {
+      [`unread.${params.recipientUid}`]: admin.firestore.FieldValue.increment(1),
+      ...(params.localizedPreview == null
+        ? {}
+        : {
+            [`lastMessagePreviewFor.${params.recipientUid}`]:
+              params.localizedPreview,
+          }),
+    });
+    return access;
+  });
+}
+
 async function assertActiveDirectRoomMutation(
   tx: FirebaseFirestore.Transaction,
   uid: string,
+  matchId: string,
   matchData: FirebaseFirestore.DocumentData
 ): Promise<string> {
   const userIds = matchData.userIds as string[] | undefined;
   if (!isExactDirectChatParticipants(userIds) || !userIds.includes(uid)) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'User not in this match'
-    );
+    throw directRoomUnavailable();
   }
   if (matchData.isActive !== true) {
-    throw new functions.https.HttpsError('permission-denied', 'Match is not active');
+    throw directRoomUnavailable();
   }
-  if (Array.isArray(matchData.hiddenFor) && matchData.hiddenFor.length > 0) {
-    throw new functions.https.HttpsError('permission-denied', 'Match is not visible');
+  if (!Array.isArray(matchData.hiddenFor) || matchData.hiddenFor.length > 0) {
+    throw directRoomUnavailable();
   }
   const otherUid = userIds.find((participant) => participant !== uid)!;
+  const expectedUserIds = [uid, otherUid].sort();
+  const pairKey = expectedUserIds.join('_');
   const callerRef = db.collection('users').doc(uid);
   const otherRef = db.collection('users').doc(otherUid);
-  const [otherSnap, callerBlock, otherBlock] = await Promise.all([
+  const [otherSnap, callerBlock, otherBlock, pairSnap] = await Promise.all([
     tx.get(otherRef),
     tx.get(callerRef.collection('blocks').doc(otherUid)),
     tx.get(otherRef.collection('blocks').doc(uid)),
+    tx.get(db.collection('chatPairs').doc(pairKey)),
   ]);
-  assertActiveAccountSnapshot(otherSnap, 'Chat participant');
+  if (activeAccountIssue({
+    exists: otherSnap.exists,
+    userData: otherSnap.data(),
+  }) !== null) {
+    throw directRoomUnavailable();
+  }
   if (callerBlock.exists || otherBlock.exists) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat is blocked between these users'
-    );
+    throw directRoomUnavailable();
+  }
+  if (!isReusableDirectRoom({
+    matchId,
+    matchExists: true,
+    matchActive: matchData.isActive === true,
+    matchUserIds: matchData.userIds,
+    matchPairKey: matchData.pairKey,
+    directRoomVersion: matchData.directRoomVersion,
+    hiddenFor: matchData.hiddenFor,
+    expectedUserIds,
+    pointerExists: pairSnap.exists,
+    pointerId: pairSnap.id,
+    pointerUserIds: pairSnap.data()?.userIds,
+    pointerPairKey: pairSnap.data()?.pairKey,
+    pointerActiveMatchId: pairSnap.data()?.activeMatchId,
+    pointerClosedMatchId: pairSnap.data()?.closedMatchId,
+    pointerClosedReason: pairSnap.data()?.closedReason,
+  })) {
+    throw directRoomUnavailable();
   }
   return otherUid;
 }
@@ -959,21 +1119,21 @@ async function assertActiveMediaUploadRoom(
     !matchSnap.exists ||
     matchData?.directRoomVersion !== 1 ||
     matchData?.isActive !== true ||
-    (Array.isArray(matchData?.hiddenFor) && matchData.hiddenFor.length > 0)
+    !Array.isArray(matchData?.hiddenFor) ||
+    matchData.hiddenFor.length > 0
   ) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat room is no longer available for media upload'
-    );
+    throw directRoomUnavailable();
   }
   const userIds = matchData?.userIds as string[] | undefined;
   if (!isExactDirectChatParticipants(userIds) || !userIds.includes(uid)) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat room participants are invalid'
-    );
+    throw directRoomUnavailable();
   }
-  const otherUid = await assertActiveDirectRoomMutation(tx, uid, matchData);
+  const otherUid = await assertActiveDirectRoomMutation(
+    tx,
+    uid,
+    matchId,
+    matchData
+  );
   const pairKey = [uid, otherUid].sort().join('_');
   const pairSnap = await tx.get(db.collection('chatPairs').doc(pairKey));
   if (
@@ -982,10 +1142,7 @@ async function assertActiveMediaUploadRoom(
     !isExactDirectChatParticipants(pairSnap.data()?.userIds, [uid, otherUid]) ||
     pairSnap.data()?.activeMatchId !== matchId
   ) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Chat room is no longer the active room for this pair'
-    );
+    throw directRoomUnavailable();
   }
 }
 
@@ -1030,8 +1187,19 @@ async function writeMessageTranslationForActiveAccount(
   const otherUserRef = db.collection('users').doc(otherUid);
   const callerBlockRef = userRef.collection('blocks').doc(otherUid);
   const recipientBlockRef = otherUserRef.collection('blocks').doc(uid);
+  const expectedUserIds = [uid, otherUid].sort();
+  const pairKey = expectedUserIds.join('_');
+  const pairRef = db.collection('chatPairs').doc(pairKey);
   await db.runTransaction(async (tx) => {
-    const [userSnap, otherUserSnap, matchSnap, messageSnap, callerBlock, recipientBlock] =
+    const [
+      userSnap,
+      otherUserSnap,
+      matchSnap,
+      messageSnap,
+      callerBlock,
+      recipientBlock,
+      pairSnap,
+    ] =
       await Promise.all([
       tx.get(userRef),
       tx.get(otherUserRef),
@@ -1039,22 +1207,25 @@ async function writeMessageTranslationForActiveAccount(
       tx.get(messageRef),
       tx.get(callerBlockRef),
       tx.get(recipientBlockRef),
+      tx.get(pairRef),
     ]);
     assertActiveAccountSnapshot(userSnap);
-    assertActiveAccountSnapshot(otherUserSnap, 'Chat participant');
     if (
-      !matchSnap.exists ||
-      matchSnap.data()?.isActive !== true ||
-      !isExactDirectChatParticipants(matchSnap.data()?.userIds, [uid, otherUid]) ||
-      (Array.isArray(matchSnap.data()?.hiddenFor) &&
-        matchSnap.data()!.hiddenFor.length > 0) ||
+      activeAccountIssue({
+        exists: otherUserSnap.exists,
+        userData: otherUserSnap.data(),
+      }) !== null ||
       callerBlock.exists ||
-      recipientBlock.exists
+      recipientBlock.exists ||
+      !reusableDirectRoomSnapshots({
+        matchId: matchRef.id,
+        matchSnap,
+        pairSnap,
+        expectedUserIds,
+        pairKey,
+      })
     ) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'Chat room is no longer available'
-      );
+      throw directRoomUnavailable();
     }
     if (!messageSnap.exists) {
       throw new functions.https.HttpsError('not-found', 'Message not found');
@@ -1601,16 +1772,13 @@ async function notifyIncomingCall(params: {
 }
 
 async function notifyNewDirectChat(params: {
-  starterName: string;
   matchId: string;
+  senderUid: string;
   recipientUid: string;
 }): Promise<void> {
-  const recipientSnap = await db.collection('users').doc(params.recipientUid).get();
-  const recipientData = recipientSnap.data();
-  if (activeAccountIssue({
-    exists: recipientSnap.exists,
-    userData: recipientData,
-  }) !== null) return;
+  const access = await readAuthorizedDirectRoomSideEffectContext(params);
+  if (access == null) return;
+  const { recipientData, senderData } = access;
   const fcmToken: string | null = recipientData?.fcmToken ?? null;
   const notificationsEnabled: boolean =
     recipientData?.notificationsEnabled ?? true;
@@ -1620,7 +1788,7 @@ async function notifyNewDirectChat(params: {
     await admin.messaging().send({
       token: fcmToken,
       notification: {
-        title: params.starterName,
+        title: senderData.displayName ?? 'Hana',
         body: '새 대화방이 열렸어요',
       },
       data: {
@@ -2204,125 +2372,215 @@ async function reserveTranslationQuota(
 async function findMatch(uidA: string, uidB: string): Promise<string | null> {
   const ids = [uidA, uidB].sort();
   const pairKey = ids.join('_');
-  const pairSnap = await db.collection('chatPairs').doc(pairKey).get();
-  const activeMatchId = pairSnap.data()?.activeMatchId;
-
-  if (typeof activeMatchId === 'string' && activeMatchId.length > 0) {
-    const matchSnap = await db.collection('matches').doc(activeMatchId).get();
-    const userIds = matchSnap.data()?.userIds as string[] | undefined;
-    if (
-      matchSnap.exists &&
-      matchSnap.data()?.isActive === true &&
-      isExactDirectChatParticipants(userIds, ids)
-    ) {
-      return activeMatchId;
+  const pairRef = db.collection('chatPairs').doc(pairKey);
+  return db.runTransaction(async (tx) => {
+    const pairSnap = await tx.get(pairRef);
+    const activeMatchId = pairSnap.data()?.activeMatchId;
+    if (typeof activeMatchId !== 'string' || activeMatchId.length === 0) {
+      return null;
     }
-  }
-
-  // Legacy fallback for deterministic room IDs created before chatPairs.
-  const legacyMatchId = pairKey;
-  const matchSnap = await db.collection('matches').doc(legacyMatchId).get();
-
-  if (
-    matchSnap.exists &&
-    matchSnap.data()?.isActive === true &&
-    isExactDirectChatParticipants(matchSnap.data()?.userIds, ids)
-  ) {
-    const pairRef = db.collection('chatPairs').doc(pairKey);
-    const migrated = await db.runTransaction(async (tx) => {
-      const [freshMatch, freshPair] = await Promise.all([
-        tx.get(matchSnap.ref),
-        tx.get(pairRef),
-      ]);
-      if (
-        !freshMatch.exists ||
-        freshMatch.data()?.isActive !== true ||
-        !isExactDirectChatParticipants(freshMatch.data()?.userIds, ids)
-      ) {
-        return false;
-      }
-      const freshActiveId = freshPair.data()?.activeMatchId;
-      if (
-        typeof freshActiveId === 'string' &&
-        freshActiveId.length > 0 &&
-        freshActiveId !== legacyMatchId
-      ) {
-        return false;
-      }
-      tx.set(pairRef, {
-        pairKey,
-        userIds: ids,
-        activeMatchId: legacyMatchId,
-        closedMatchId: admin.firestore.FieldValue.delete(),
-        closedReason: admin.firestore.FieldValue.delete(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-      return true;
-    });
-    return migrated ? legacyMatchId : null;
-  }
-
-  return null;
+    const matchSnap = await tx.get(
+      db.collection('matches').doc(activeMatchId)
+    );
+    return reusableDirectRoomSnapshots({
+      matchId: activeMatchId,
+      matchSnap,
+      pairSnap,
+      expectedUserIds: ids,
+      pairKey,
+    }) ? activeMatchId : null;
+  });
 }
 
-async function closePairChatForSafety(params: {
-  actorUid: string;
-  targetUid: string;
-  candidateMatchId: string | null;
-  closedReason: 'blocked' | 'reported';
-}): Promise<string | null> {
-  if (!params.candidateMatchId) return null;
+type SafetyClosureReason = 'blocked' | 'reported' | 'left_chat';
 
+interface ActiveCallClosureSnapshot {
+  pointerRef: FirebaseFirestore.DocumentReference;
+  pointerExists: boolean;
+  callRef: FirebaseFirestore.DocumentReference | null;
+  callData: FirebaseFirestore.DocumentData | null;
+  closeCall: boolean;
+}
+
+async function readActiveCallClosures(
+  tx: FirebaseFirestore.Transaction,
+  matchIds: readonly string[],
+  expectedUserIds: readonly string[]
+): Promise<ActiveCallClosureSnapshot[]> {
+  const pointerRefs = matchIds.map((matchId) =>
+    db.collection('activeCalls').doc(matchId)
+  );
+  const pointerSnaps = await Promise.all(pointerRefs.map((ref) => tx.get(ref)));
+  const callRefs = pointerSnaps.map((snapshot) => {
+    const callId = snapshot.data()?.callId;
+    return typeof callId === 'string' && callId.length > 0
+      ? db.collection('calls').doc(callId)
+      : null;
+  });
+  const callSnaps = await Promise.all(callRefs.map((ref) =>
+    ref == null ? Promise.resolve(null) : tx.get(ref)
+  ));
+
+  return pointerSnaps.map((pointerSnap, index) => {
+    const callSnap = callSnaps[index];
+    const callData = callSnap?.data() ?? null;
+    const callUserIds = callData?.participantUids ?? [
+      callData?.callerUid,
+      callData?.calleeUid,
+    ];
+    return {
+      pointerRef: pointerRefs[index],
+      pointerExists: pointerSnap.exists,
+      callRef: callRefs[index],
+      callData,
+      closeCall:
+        callSnap?.exists === true &&
+        callData?.matchId === matchIds[index] &&
+        isExactDirectChatParticipants(callUserIds, expectedUserIds) &&
+        (callData?.status === 'ringing' || callData?.status === 'accepted'),
+    };
+  });
+}
+
+function stageActiveCallClosures(
+  tx: FirebaseFirestore.Transaction,
+  closures: readonly ActiveCallClosureSnapshot[],
+  params: {
+    actorUid: string;
+    closedReason: SafetyClosureReason;
+    now: admin.firestore.Timestamp;
+  }
+): void {
+  for (const closure of closures) {
+    if (closure.closeCall && closure.callRef != null) {
+      const acceptedAtMillis = closure.callData?.acceptedAt?.toMillis?.();
+      tx.update(closure.callRef, {
+        status: 'ended',
+        ...(params.closedReason === 'left_chat'
+          ? { endedBy: params.actorUid }
+          : { endedBy: admin.firestore.FieldValue.delete() }),
+        endedReason: 'room_closed',
+        endedAt: params.now,
+        ...(typeof acceptedAtMillis === 'number'
+          ? {
+              durationSec: Math.max(
+                0,
+                Math.floor((params.now.toMillis() - acceptedAtMillis) / 1000)
+              ),
+            }
+          : {}),
+        updatedAt: params.now,
+      });
+    }
+    if (closure.pointerExists) tx.delete(closure.pointerRef);
+  }
+}
+
+/**
+ * Stages every exact-pair room, pair pointer, and current call closure inside
+ * the caller's existing block/report transaction. A sentinel aborts the whole
+ * safety action instead of leaving a partially hidden relationship.
+ */
+async function stageAllActivePairSafetyClosures(
+  tx: FirebaseFirestore.Transaction,
+  params: {
+    actorUid: string;
+    targetUid: string;
+    closedReason: 'blocked' | 'reported';
+  }
+): Promise<string[]> {
   const userIds = [params.actorUid, params.targetUid].sort();
   const pairKey = userIds.join('_');
-  const matchRef = db.collection('matches').doc(params.candidateMatchId);
-  const pairRef = db.collection('chatPairs').doc(pairKey);
-
-  return db.runTransaction(async (tx) => {
-    const [matchSnap, pairSnap] = await Promise.all([
-      tx.get(matchRef),
-      tx.get(pairRef),
+  const activeRoomsQuery = db.collection('matches')
+    .where('pairKey', '==', pairKey)
+    .where('isActive', '==', true)
+    .limit(MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION + 1);
+  const pairPointersQuery = db.collection('chatPairs')
+    .where('pairKey', '==', pairKey)
+    .limit(MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION + 1);
+  const canonicalPairRef = db.collection('chatPairs').doc(pairKey);
+  const [activeRoomsSnap, pairPointersSnap, canonicalPairSnap] =
+    await Promise.all([
+      tx.get(activeRoomsQuery),
+      tx.get(pairPointersQuery),
+      tx.get(canonicalPairRef),
     ]);
-    const decision = decideCloseActiveChatPolicy({
-      matchId: params.candidateMatchId!,
-      matchExists: matchSnap.exists,
-      matchActive: matchSnap.data()?.isActive === true,
-      matchUserIds: matchSnap.data()?.userIds,
-      actorUid: params.actorUid,
-      targetUid: params.targetUid,
-      pairActiveMatchId: pairSnap.data()?.activeMatchId,
-    });
 
-    if (!decision.closeMatch) return null;
+  const selectedRooms = activePairRoomIdsForSafety({
+    records: activeRoomsSnap.docs.map((doc) => ({
+      id: doc.id,
+      isActive: doc.data().isActive,
+      userIds: doc.data().userIds,
+    })),
+    actorUid: params.actorUid,
+    targetUid: params.targetUid,
+  });
+  if (
+    !selectedRooms.scanComplete ||
+    pairPointersSnap.size > MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Unable to close every active chat safely'
+    );
+  }
 
-    tx.update(matchRef, {
+  if (
+    canonicalPairSnap.exists &&
+    !isExactDirectChatParticipants(canonicalPairSnap.data()?.userIds, userIds)
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Unable to close every active chat safely'
+    );
+  }
+
+  const matchIds = selectedRooms.matchIds;
+  const matchIdSet = new Set(matchIds);
+  const callClosures = await readActiveCallClosures(tx, matchIds, userIds);
+  const now = admin.firestore.Timestamp.now();
+
+  for (const matchId of matchIds) {
+    tx.update(db.collection('matches').doc(matchId), {
       isActive: false,
-      hiddenFor: admin.firestore.FieldValue.arrayUnion(
-        ...closedChatHiddenParticipants(params.actorUid, params.targetUid)
-      ),
+      hiddenFor: userIds,
       closedBy: params.actorUid,
       closedReason: params.closedReason,
-      closedAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      closedAt: now,
+      updatedAt: now,
     });
+  }
 
-    if (decision.clearPairPointer) {
-      tx.set(
-        pairRef,
-        {
-          pairKey,
-          userIds,
-          activeMatchId: admin.firestore.FieldValue.delete(),
-          closedMatchId: params.candidateMatchId,
-          closedReason: params.closedReason,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+  const pointerSnaps = new Map<
+    string,
+    FirebaseFirestore.DocumentSnapshot
+  >(pairPointersSnap.docs.map((snap) => [snap.ref.path, snap]));
+  if (canonicalPairSnap.exists) {
+    pointerSnaps.set(canonicalPairSnap.ref.path, canonicalPairSnap);
+  }
+  for (const pointerSnap of pointerSnaps.values()) {
+    if (!isExactDirectChatParticipants(pointerSnap.data()?.userIds, userIds)) {
+      continue;
     }
+    const activeMatchId = pointerSnap.data()?.activeMatchId;
+    tx.set(pointerSnap.ref, {
+      activeMatchId: admin.firestore.FieldValue.delete(),
+      ...(typeof activeMatchId === 'string' && matchIdSet.has(activeMatchId)
+        ? {
+            closedMatchId: activeMatchId,
+            closedReason: params.closedReason,
+          }
+        : {}),
+      updatedAt: now,
+    }, { merge: true });
+  }
 
-    return params.candidateMatchId;
+  stageActiveCallClosures(tx, callClosures, {
+    actorUid: params.actorUid,
+    closedReason: params.closedReason,
+    now,
   });
+  return matchIds;
 }
 
 function reportContentDocumentRefs(
@@ -3039,7 +3297,7 @@ async function reserveMediaUploadForProtocol(
         : null;
       const matchSnap = matchRef == null ? null : await tx.get(matchRef);
       if (matchRef != null && (matchSnap == null || !matchSnap.exists)) {
-        throw new functions.https.HttpsError('not-found', 'Chat room not found');
+        throw directRoomUnavailable();
       }
 
       const matchData = matchSnap?.data();
@@ -3051,19 +3309,14 @@ async function reserveMediaUploadForProtocol(
           !participants.includes(uid) ||
           matchData?.directRoomVersion !== 1 ||
           matchData?.isActive !== true ||
-          (Array.isArray(matchData?.hiddenFor) && matchData.hiddenFor.length > 0)
+          !Array.isArray(matchData?.hiddenFor) ||
+          matchData.hiddenFor.length > 0
         ) {
-          throw new functions.https.HttpsError(
-            'permission-denied',
-            'Chat room is not available for media upload'
-          );
+          throw directRoomUnavailable();
         }
         otherUid = participants.find((participantUid) => participantUid !== uid) ?? null;
         if (otherUid == null) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            'Chat room participants are invalid'
-          );
+          throw directRoomUnavailable();
         }
       }
 
@@ -3133,34 +3386,28 @@ async function reserveMediaUploadForProtocol(
         exists: otherUserSnap.exists,
         userData: otherUserSnap.data(),
       }) !== null) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Chat participant is unavailable'
-        );
+        throw directRoomUnavailable();
       }
       if (callerBlockSnap?.exists || recipientBlockSnap?.exists) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Chat participants have blocked each other'
-        );
+        throw directRoomUnavailable();
       }
       if (
         request.kind === 'chat' &&
-        (uploadProtocolVersion === mediaUploadProtocolVersion
+        (matchData?.pairKey !== expectedPairKey ||
+          (uploadProtocolVersion === mediaUploadProtocolVersion
           ? pairSnap?.exists !== true ||
             pairSnap.data()?.pairKey !== expectedPairKey ||
             !isExactDirectChatParticipants(
               pairSnap.data()?.userIds,
               [uid, otherUid!]
             ) ||
-            pairSnap.data()?.activeMatchId !== request.matchId
+            pairSnap.data()?.activeMatchId !== request.matchId ||
+            pairSnap.data()?.closedMatchId !== undefined ||
+            pairSnap.data()?.closedReason !== undefined
           : pairSnap?.exists === true &&
-            pairSnap.data()?.activeMatchId !== request.matchId)
+            pairSnap.data()?.activeMatchId !== request.matchId))
       ) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Chat room is no longer the active room for this pair'
-        );
+        throw directRoomUnavailable();
       }
 
       const countField = request.kind === 'profile'
@@ -7076,38 +7323,29 @@ export const sendMessage = regionalFunctions.https.onCall(
       const matchData = matchSnap.data()!;
       const userIds = matchData.userIds as string[] | undefined;
       if (!isExactDirectChatParticipants(userIds) || !userIds.includes(uid)) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'User not in this match'
-        );
+        throw directRoomUnavailable();
       }
 
       if (matchData.isActive !== true) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Match is not active'
-        );
+        throw directRoomUnavailable();
       }
 
       const hiddenFor = matchData.hiddenFor as string[] | undefined;
-      if (Array.isArray(hiddenFor) && hiddenFor.includes(uid)) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Match is not active'
-        );
+      if (!Array.isArray(hiddenFor) || hiddenFor.length > 0) {
+        throw directRoomUnavailable();
       }
 
       const otherUid = userIds.find((id) => id !== uid);
       if (!otherUid) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'Invalid match participants'
-        );
+        throw directRoomUnavailable();
       }
 
       const otherUserRef = db.collection('users').doc(otherUid);
       const callerBlockRef = db.collection('users').doc(uid).collection('blocks').doc(otherUid);
       const recipientBlockRef = db.collection('users').doc(otherUid).collection('blocks').doc(uid);
+      const expectedUserIds = [uid, otherUid].sort();
+      const pairKey = expectedUserIds.join('_');
+      const pairRef = db.collection('chatPairs').doc(pairKey);
       const replyToMessageId = typeof data.replyToMessageId === 'string'
         ? data.replyToMessageId.trim()
         : '';
@@ -7115,12 +7353,20 @@ export const sendMessage = regionalFunctions.https.onCall(
         ? matchRef.collection('messages').doc(replyToMessageId)
         : null;
       const callerUserRef = db.collection('users').doc(uid);
-      const [callerUserSnap, otherUserSnap, callerBlockSnap, recipientBlockSnap, replyMessageSnap] = await Promise.all([
+      const [
+        callerUserSnap,
+        otherUserSnap,
+        callerBlockSnap,
+        recipientBlockSnap,
+        replyMessageSnap,
+        pairSnap,
+      ] = await Promise.all([
         tx.get(callerUserRef),
         tx.get(otherUserRef),
         tx.get(callerBlockRef),
         tx.get(recipientBlockRef),
         replyMessageRef == null ? Promise.resolve(null) : tx.get(replyMessageRef),
+        tx.get(pairRef),
       ]);
 
       if (activeAccountIssue({
@@ -7139,17 +7385,21 @@ export const sendMessage = regionalFunctions.https.onCall(
           userData: otherUserSnap.data(),
         }) !== null
       ) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'Recipient is unavailable'
-        );
+        throw directRoomUnavailable();
       }
 
       if (callerBlockSnap.exists || recipientBlockSnap.exists) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'One or both users have blocked each other'
-        );
+        throw directRoomUnavailable();
+      }
+
+      if (!reusableDirectRoomSnapshots({
+        matchId,
+        matchSnap,
+        pairSnap,
+        expectedUserIds,
+        pairKey,
+      })) {
+        throw directRoomUnavailable();
       }
 
       if (replyMessageRef != null) {
@@ -7296,38 +7546,52 @@ export const retryMessageTranslation = regionalFunctions.https.onCall(
     const matchData = matchSnap.data()!;
     if (!isExactDirectChatParticipants(matchData.userIds) ||
       !matchData.userIds.includes(uid)) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'User not in this match'
-      );
+      throw directRoomUnavailable();
     }
 
-    if (matchData.isActive !== true) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'Match is not active'
-      );
+    if (
+      matchData.isActive !== true ||
+      !Array.isArray(matchData.hiddenFor) ||
+      matchData.hiddenFor.length > 0
+    ) {
+      throw directRoomUnavailable();
     }
 
     const otherUid = (matchData.userIds as string[]).find((id) => id !== uid);
     if (!otherUid) {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'Invalid match participants'
-      );
+      throw directRoomUnavailable();
     }
 
-    const [callerBlockedOther, otherBlockedCaller, otherUserSnap] = await Promise.all([
+    const expectedUserIds = [uid, otherUid].sort();
+    const pairKey = expectedUserIds.join('_');
+    const [
+      callerBlockedOther,
+      otherBlockedCaller,
+      otherUserSnap,
+      pairSnap,
+    ] = await Promise.all([
       db.collection('users').doc(uid).collection('blocks').doc(otherUid).get(),
       db.collection('users').doc(otherUid).collection('blocks').doc(uid).get(),
       db.collection('users').doc(otherUid).get(),
+      db.collection('chatPairs').doc(pairKey).get(),
     ]);
 
-    if (callerBlockedOther.exists || otherBlockedCaller.exists) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'One or both users have blocked each other'
-      );
+    if (
+      activeAccountIssue({
+        exists: otherUserSnap.exists,
+        userData: otherUserSnap.data(),
+      }) !== null ||
+      callerBlockedOther.exists ||
+      otherBlockedCaller.exists ||
+      !reusableDirectRoomSnapshots({
+        matchId,
+        matchSnap,
+        pairSnap,
+        expectedUserIds,
+        pairKey,
+      })
+    ) {
+      throw directRoomUnavailable();
     }
 
     const messageData = messageSnap.data()!;
@@ -7444,7 +7708,7 @@ export const setMessageReaction = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('not-found', 'Message not found');
       }
       const matchData = matchSnap.data()!;
-      await assertActiveDirectRoomMutation(tx, uid, matchData);
+      await assertActiveDirectRoomMutation(tx, uid, matchId, matchData);
 
       tx.update(messageRef, {
         [`reactions.${uid}`]: emoji.length > 0
@@ -7507,6 +7771,12 @@ export const leaveChat = regionalFunctions.https.onCall(
       const pairKey = sortedUserIds.join('_');
       const pairRef = db.collection('chatPairs').doc(pairKey);
       const pairSnap = await tx.get(pairRef);
+      const callClosures = await readActiveCallClosures(
+        tx,
+        [matchId],
+        sortedUserIds
+      );
+      const now = admin.firestore.Timestamp.now();
       const decision = decideCloseActiveChatPolicy({
         matchId,
         matchExists: true,
@@ -7519,15 +7789,22 @@ export const leaveChat = regionalFunctions.https.onCall(
 
       // A repeated leave for a historical room is idempotent and must never
       // clear a concurrently-created replacement room's pair pointer.
-      if (!decision.closeMatch) return false;
+      if (!decision.closeMatch) {
+        stageActiveCallClosures(tx, callClosures, {
+          actorUid: uid,
+          closedReason: 'left_chat',
+          now,
+        });
+        return false;
+      }
 
       tx.update(matchRef, {
         isActive: false,
         hiddenFor: admin.firestore.FieldValue.arrayUnion(...userIds),
         closedBy: uid,
         closedReason: 'left_chat',
-        closedAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        closedAt: now,
+        updatedAt: now,
       });
 
       if (decision.clearPairPointer) {
@@ -7539,11 +7816,16 @@ export const leaveChat = regionalFunctions.https.onCall(
             activeMatchId: admin.firestore.FieldValue.delete(),
             closedMatchId: matchId,
             closedReason: 'left_chat',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: now,
           },
           { merge: true }
         );
       }
+      stageActiveCallClosures(tx, callClosures, {
+        actorUid: uid,
+        closedReason: 'left_chat',
+        now,
+      });
       return true;
     });
 
@@ -7583,7 +7865,7 @@ export const setChatFavorite = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('not-found', 'Match not found');
       }
       const matchData = matchSnap.data()!;
-      await assertActiveDirectRoomMutation(tx, uid, matchData);
+      await assertActiveDirectRoomMutation(tx, uid, matchId, matchData);
       tx.update(matchRef, {
         [`favoriteFor.${uid}`]: favorite,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -7623,7 +7905,7 @@ export const markChatRead = regionalFunctions.https.onCall(
         throw new functions.https.HttpsError('not-found', 'Match not found');
       }
       const matchData = matchSnap.data()!;
-      await assertActiveDirectRoomMutation(tx, uid, matchData);
+      await assertActiveDirectRoomMutation(tx, uid, matchId, matchData);
       tx.update(matchRef, {
         [`unread.${uid}`]: 0,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -8250,13 +8532,18 @@ export const blockUser = regionalFunctions.https.onCall(
     const callerRef = db.collection('users').doc(uid);
     const targetRef = db.collection('users').doc(targetUid);
 
-    await db.runTransaction(async (tx) => {
+    const closedMatchIds = await db.runTransaction(async (tx) => {
       const [callerSnap, freshTargetSnap] = await Promise.all([
         tx.get(callerRef),
         tx.get(targetRef),
       ]);
       assertActiveAccountSnapshot(callerSnap);
       const targetData = assertActiveAccountSnapshot(freshTargetSnap, 'Target user');
+      const closedIds = await stageAllActivePairSafetyClosures(tx, {
+        actorUid: uid,
+        targetUid,
+        closedReason: 'blocked',
+      });
       tx.set(blockRef, {
         blockedAt: now,
         reason,
@@ -8271,19 +8558,11 @@ export const blockUser = regionalFunctions.https.onCall(
         seenAt: now,
         reason: 'block',
       });
+      return closedIds;
     });
 
-    // Resolve the current active room, then atomically close it with its pair
-    // pointer. A replacement pointer created concurrently is never cleared.
-    const matchId = await findMatch(uid, targetUid);
-    const closedMatchId = await closePairChatForSafety({
-      actorUid: uid,
-      targetUid,
-      candidateMatchId: matchId,
-      closedReason: 'blocked',
-    });
-    if (closedMatchId) {
-      await notifyChatRemoved(targetUid, closedMatchId);
+    if (closedMatchIds.length > 0) {
+      await notifyChatRemoved(targetUid, closedMatchIds[0]);
     }
 
     return { ok: true };
@@ -8435,7 +8714,7 @@ export const reportUser = regionalFunctions.https.onCall(
     const reporterRef = db.collection('users').doc(uid);
     const contentRefs = reportContentDocumentRefs(contentContext);
 
-    await db.runTransaction(async (transaction) => {
+    const closedMatchIds = await db.runTransaction(async (transaction) => {
       const [reporterSnap, targetSnap, ...contentSnaps] = await Promise.all([
         transaction.get(reporterRef),
         transaction.get(targetRef),
@@ -8450,6 +8729,11 @@ export const reportUser = regionalFunctions.https.onCall(
             targetUid,
           })
         : null;
+      const closedIds = await stageAllActivePairSafetyClosures(transaction, {
+        actorUid: uid,
+        targetUid,
+        closedReason: 'reported',
+      });
 
       transaction.set(reportRef, {
         reportId,
@@ -8481,37 +8765,11 @@ export const reportUser = regionalFunctions.https.onCall(
         seenAt: now,
         reason: 'report',
       });
+      return closedIds;
     });
 
-    let activeMatchId: string | null = null;
-    if (requestedMatchId) {
-      const requestedMatchSnap = await db.collection('matches').doc(requestedMatchId).get();
-      const requestedUserIds = requestedMatchSnap.data()?.userIds as string[] | undefined;
-      if (
-        canUseRequestedMatchForSafety({
-          exists: requestedMatchSnap.exists,
-          isActive: requestedMatchSnap.data()?.isActive === true,
-          userIds: requestedUserIds,
-          actorUid: uid,
-          targetUid,
-        })
-      ) {
-        activeMatchId = requestedMatchId;
-      }
-    }
-
-    if (!activeMatchId) {
-      activeMatchId = await findMatch(uid, targetUid);
-    }
-
-    const closedMatchId = await closePairChatForSafety({
-      actorUid: uid,
-      targetUid,
-      candidateMatchId: activeMatchId,
-      closedReason: 'reported',
-    });
-    if (closedMatchId) {
-      await notifyChatRemoved(targetUid, closedMatchId);
+    if (closedMatchIds.length > 0) {
+      await notifyChatRemoved(targetUid, closedMatchIds[0]);
     }
 
     return {
@@ -8544,36 +8802,23 @@ export const onMessageCreated = regionalFunctions.firestore
       const matchSnap = await db.collection('matches').doc(matchId).get();
       if (matchSnap.exists) {
         const matchData = matchSnap.data()!;
-        const recipientUid: string = (matchData.userIds as string[]).find(
+        if (
+          !isExactDirectChatParticipants(matchData.userIds) ||
+          !matchData.userIds.includes(senderUid)
+        ) return;
+        const recipientUid: string = matchData.userIds.find(
           (id) => id !== senderUid
         ) ?? '';
 
         if (recipientUid) {
-          const [senderBlockedRecipient, recipientBlockedSender] = await Promise.all([
-            db.collection('users').doc(senderUid).collection('blocks').doc(recipientUid).get(),
-            db.collection('users').doc(recipientUid).collection('blocks').doc(senderUid).get(),
-          ]);
-
-          // Load profiles before translation and notification side effects.
-          const [recipientSnap, senderSnap] = await Promise.all([
-            db.collection('users').doc(recipientUid).get(),
-            db.collection('users').doc(senderUid).get(),
-          ]);
-          const recipientData = recipientSnap.data();
-          const senderData = senderSnap.data();
-
-          if (!canApplyMessageSideEffects({
-            matchActive: matchData.isActive === true,
-            senderBlockedRecipient: senderBlockedRecipient.exists,
-            recipientBlockedSender: recipientBlockedSender.exists,
-            recipientExists: recipientSnap.exists,
-            recipientBanned: activeAccountIssue({
-              exists: recipientSnap.exists,
-              userData: recipientData,
-            }) !== null,
-          })) {
-            return;
-          }
+          const initialAccess =
+            await readAuthorizedDirectRoomSideEffectContext({
+              matchId,
+              senderUid,
+              recipientUid,
+            });
+          if (initialAccess == null) return;
+          const { recipientData, senderData } = initialAccess;
 
           let resolvedOriginalLang: 'ko' | 'ja' | 'unknown' = 'unknown';
           let resolvedTranslations: Record<string, string | null> = {
@@ -8655,21 +8900,32 @@ export const onMessageCreated = regionalFunctions.firestore
               maxLength: 50,
             });
 
-          // Increment unread and persist a recipient-specific translated
-          // preview without replacing the immutable original preview.
-          await db.collection('matches').doc(matchId).update({
-            [`unread.${recipientUid}`]: admin.firestore.FieldValue.increment(1),
-            ...(localizedPreview == null
-              ? {}
-              : { [`lastMessagePreviewFor.${recipientUid}`]: localizedPreview }),
+          // Reauthorize inside the same transaction as the unread mutation so
+          // a concurrent block/closure cannot leave a recipient side effect.
+          const unreadAccess = await applyAuthorizedMessageRecipientState({
+            matchId,
+            senderUid,
+            recipientUid,
+            localizedPreview,
           });
+          if (unreadAccess == null) return;
 
-          // Use recipient profile for FCM token + settings
-          const fcmToken: string | null = recipientData?.fcmToken ?? null;
+          // Re-read once more immediately before push delivery. Translation or
+          // unread work can race with a block, ban, room closure, or pointer
+          // replacement, and a stale token must not receive the notification.
+          const pushAccess = await readAuthorizedDirectRoomSideEffectContext({
+            matchId,
+            senderUid,
+            recipientUid,
+          });
+          if (pushAccess == null) return;
+          const pushRecipientData = pushAccess.recipientData;
+          const pushSenderData = pushAccess.senderData;
+          const fcmToken: string | null = pushRecipientData.fcmToken ?? null;
           const notificationsEnabled: boolean =
-            recipientData?.notificationsEnabled ?? true;
+            pushRecipientData.notificationsEnabled ?? true;
           const nightQuietEnabled: boolean =
-            recipientData?.nightQuietEnabled ?? false;
+            pushRecipientData.nightQuietEnabled ?? false;
           const nowKst = new Date(Date.now() + 9 * 60 * 60 * 1000);
           const hourKst = nowKst.getUTCHours();
 
@@ -8680,7 +8936,7 @@ export const onMessageCreated = regionalFunctions.firestore
             hourKst,
           }) && fcmToken) {
             const senderName: string =
-              senderData?.displayName ?? '하나';
+              pushSenderData.displayName ?? '하나';
             const preview = isStickerMessage
               ? 'Sticker'
               : isImageMessage
@@ -8689,7 +8945,7 @@ export const onMessageCreated = regionalFunctions.firestore
                   originalText: messageData.originalText,
                   originalLang: resolvedOriginalLang,
                   translations: resolvedTranslations,
-                  recipientProfile: recipientData,
+                  recipientProfile: pushRecipientData,
                   maxLength: 60,
                 }) ?? '';
 
@@ -8764,17 +9020,13 @@ export const onUserBlocked = regionalFunctions.firestore
   .onCreate(async (_snap, context) => {
     const { uid, targetUid } = context.params;
 
-    try {
-      const matchId = await findMatch(uid, targetUid);
-      await closePairChatForSafety({
+    await db.runTransaction(async (tx) => {
+      await stageAllActivePairSafetyClosures(tx, {
         actorUid: uid,
         targetUid,
-        candidateMatchId: matchId,
         closedReason: 'blocked',
       });
-    } catch (error) {
-      console.error('onUserBlocked error:', error);
-    }
+    });
   });
 
 /**
@@ -8853,6 +9105,147 @@ export const onPostLikeDeleted = regionalFunctions.firestore
  * then recompute the rated user's avgRating aggregate.
  */
 /**
+ * listActiveChats(data: { limit?: number, cursor?: string })
+ * -> { rooms: SanitizedActiveChat[], nextCursor: string | null }
+ *
+ * Firestore cannot prove bilateral block and peer-account lookups for a
+ * collection query. Keep direct list reads closed and return only rooms that
+ * pass the full current-pointer contract in one bounded server transaction.
+ */
+export const listActiveChats = regionalFunctions.https.onCall(
+  async (data: any, context: functions.https.CallableContext) => {
+    const uid = await requireAuthAndNotBanned(context);
+    const requestedLimit = data?.limit ?? 20;
+    const cursor = data?.cursor ?? null;
+    if (
+      !Number.isSafeInteger(requestedLimit) ||
+      requestedLimit < 1 ||
+      requestedLimit > 20
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'limit must be an integer from 1 to 20'
+      );
+    }
+    if (
+      cursor !== null &&
+      (typeof cursor !== 'string' ||
+        cursor.length === 0 ||
+        cursor.length > 128 ||
+        cursor.includes('/'))
+    ) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'cursor must be a valid room id'
+      );
+    }
+
+    const result = await db.runTransaction(async (tx) => {
+      let roomsQuery: FirebaseFirestore.Query = db.collection('matches')
+        .where('userIds', 'array-contains', uid)
+        .where('isActive', '==', true)
+        .where('directRoomVersion', '==', 1)
+        .orderBy(admin.firestore.FieldPath.documentId())
+        .limit(requestedLimit + 1);
+      if (cursor !== null) roomsQuery = roomsQuery.startAfter(cursor);
+
+      const [candidateSnap, callerSnap] = await Promise.all([
+        tx.get(roomsQuery),
+        tx.get(db.collection('users').doc(uid)),
+      ]);
+      assertActiveAccountSnapshot(callerSnap);
+      const pageDocs = candidateSnap.docs.slice(0, requestedLimit);
+      const rooms = (await Promise.all(pageDocs.map(async (roomSnap) => {
+        const room = roomSnap.data();
+        if (
+          !isExactDirectChatParticipants(room.userIds) ||
+          !room.userIds.includes(uid) ||
+          !Array.isArray(room.hiddenFor) ||
+          room.hiddenFor.length !== 0
+        ) return null;
+        const otherUid = room.userIds.find((participantUid) =>
+          participantUid !== uid
+        );
+        if (otherUid == null) return null;
+        const expectedUserIds = [uid, otherUid].sort();
+        const pairKey = expectedUserIds.join('_');
+        if (room.pairKey !== pairKey) return null;
+
+        const peerRef = db.collection('users').doc(otherUid);
+        const [pairSnap, peerSnap, callerBlockSnap, peerBlockSnap] =
+          await Promise.all([
+            tx.get(db.collection('chatPairs').doc(pairKey)),
+            tx.get(peerRef),
+            tx.get(db.collection('users').doc(uid).collection('blocks').doc(otherUid)),
+            tx.get(peerRef.collection('blocks').doc(uid)),
+          ]);
+        if (
+          activeAccountIssue({
+            exists: peerSnap.exists,
+            userData: peerSnap.data(),
+          }) !== null ||
+          callerBlockSnap.exists ||
+          peerBlockSnap.exists ||
+          !reusableDirectRoomSnapshots({
+            matchId: roomSnap.id,
+            matchSnap: roomSnap,
+            pairSnap,
+            expectedUserIds,
+            pairKey,
+          })
+        ) return null;
+
+        const peer = peerSnap.data()!;
+        const createdAtMillis = room.createdAt?.toMillis?.();
+        const lastMessageAtMillis = room.lastMessageAt?.toMillis?.();
+        const unreadCount = room.unread?.[uid];
+        const favorite = room.favoriteFor?.[uid];
+        const localizedPreview = room.lastMessagePreviewFor?.[uid];
+        return {
+          matchId: roomSnap.id,
+          userIds: expectedUserIds,
+          createdAtMillis: typeof createdAtMillis === 'number'
+            ? createdAtMillis
+            : null,
+          lastMessageAtMillis: typeof lastMessageAtMillis === 'number'
+            ? lastMessageAtMillis
+            : null,
+          lastMessagePreview: typeof localizedPreview === 'string'
+            ? localizedPreview
+            : typeof room.lastMessagePreview === 'string'
+              ? room.lastMessagePreview
+              : null,
+          unreadCount: Number.isSafeInteger(unreadCount) && unreadCount >= 0
+            ? unreadCount
+            : 0,
+          favorite: favorite === true,
+          partner: {
+            uid: otherUid,
+            displayName: typeof peer.displayName === 'string'
+              ? peer.displayName
+              : '',
+            photoUrl: firstPhoto(peer),
+            nationality: typeof peer.nationality === 'string'
+              ? peer.nationality
+              : '',
+            gender: typeof peer.gender === 'string' ? peer.gender : '',
+          },
+        };
+      }))).filter((room): room is NonNullable<typeof room> => room != null);
+
+      return {
+        rooms,
+        nextCursor: candidateSnap.size > requestedLimit && pageDocs.length > 0
+          ? pageDocs[pageDocs.length - 1].id
+          : null,
+      };
+    });
+
+    return result;
+  }
+);
+
+/**
  * startChat(data: { targetUid: string }) -> { matchId, pointBalance, keyCount, alreadyExists }
  *
  * Creates or reuses a direct 1:1 chat room.
@@ -8874,7 +9267,6 @@ export const startChat = regionalFunctions.https.onCall(
     const ids = [uid, targetUid].sort();
     const pairKey = ids.join('_');
     const pairRef = db.collection('chatPairs').doc(pairKey);
-    const legacyMatchRef = db.collection('matches').doc(pairKey);
     const userRef = db.collection('users').doc(uid);
     const targetRef = db.collection('users').doc(targetUid);
     const callerBlockRef = db.collection('users').doc(uid).collection('blocks').doc(targetUid);
@@ -8882,18 +9274,16 @@ export const startChat = regionalFunctions.https.onCall(
 
     const [
       targetSnap,
-      mySnap,
       callerBlockedTarget,
       targetBlockedCaller,
     ] = await Promise.all([
       targetRef.get(),
-      userRef.get(),
       callerBlockRef.get(),
       targetBlockRef.get(),
     ]);
 
     if (!targetSnap.exists) {
-      throw new functions.https.HttpsError('not-found', 'Target user profile not found');
+      throw directChatTargetUnavailable();
     }
 
     const targetData = targetSnap.data() ?? {};
@@ -8905,44 +9295,26 @@ export const startChat = regionalFunctions.https.onCall(
       !isEligibleExternalProfileViewer(targetData) ||
       !isPublicUserProfile(targetData)
     ) {
-      throw new functions.https.HttpsError('permission-denied', 'Target user is unavailable');
+      throw directChatTargetUnavailable();
     }
 
     if (callerBlockedTarget.exists || targetBlockedCaller.exists) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'One or both users have blocked each other'
-      );
+      throw directChatTargetUnavailable();
     }
 
-    const myData = mySnap.data() ?? {};
     const getPhoto = (d: any) =>
       Array.isArray(d.photoUrls) && d.photoUrls.length > 0 ? d.photoUrls[0] : '';
-
-    const isValidActiveMatch = (
-      snap: FirebaseFirestore.DocumentSnapshot
-    ): boolean => {
-      const data = snap.data();
-      const userIds = data?.userIds as string[] | undefined;
-      return (
-        snap.exists &&
-        data?.isActive === true &&
-        isExactDirectChatParticipants(userIds, ids)
-      );
-    };
 
     // Transaction: re-check active room, point check + deduction, then create a new room.
     const chatResult = await db.runTransaction(async (tx) => {
       const [
         freshPair,
-        freshLegacyMatch,
         freshUser,
         freshTarget,
         freshCallerBlock,
         freshTargetBlock,
       ] = await Promise.all([
         tx.get(pairRef),
-        tx.get(legacyMatchRef),
         tx.get(userRef),
         tx.get(targetRef),
         tx.get(callerBlockRef),
@@ -8961,7 +9333,7 @@ export const startChat = regionalFunctions.https.onCall(
       }
 
       if (!freshTarget.exists) {
-        throw new functions.https.HttpsError('not-found', 'Target user profile not found');
+        throw directChatTargetUnavailable();
       }
 
       const freshTargetData = freshTarget.data() ?? {};
@@ -8980,23 +9352,25 @@ export const startChat = regionalFunctions.https.onCall(
         !isEligibleExternalProfileViewer(freshTargetData) ||
         !isPublicUserProfile(freshTargetData)
       ) {
-        throw new functions.https.HttpsError('permission-denied', 'Target user is unavailable');
+        throw directChatTargetUnavailable();
       }
 
       if (freshCallerBlock.exists || freshTargetBlock.exists) {
-        throw new functions.https.HttpsError(
-          'permission-denied',
-          'One or both users have blocked each other'
-        );
+        throw directChatTargetUnavailable();
       }
 
       const activeMatchId = freshPair.data()?.activeMatchId;
-      let activeMatchRef: FirebaseFirestore.DocumentReference | null = null;
       let activePairMatchValid = false;
       if (typeof activeMatchId === 'string' && activeMatchId.length > 0) {
-        activeMatchRef = db.collection('matches').doc(activeMatchId);
+        const activeMatchRef = db.collection('matches').doc(activeMatchId);
         const activeMatchSnap = await tx.get(activeMatchRef);
-        activePairMatchValid = isValidActiveMatch(activeMatchSnap);
+        activePairMatchValid = reusableDirectRoomSnapshots({
+          matchId: activeMatchId,
+          matchSnap: activeMatchSnap,
+          pairSnap: freshPair,
+          expectedUserIds: ids,
+          pairKey,
+        });
       }
 
       const decision = decideStartChatPolicy({
@@ -9004,46 +9378,9 @@ export const startChat = regionalFunctions.https.onCall(
         activePairMatchId:
           typeof activeMatchId === 'string' ? activeMatchId : undefined,
         activePairMatchValid,
-        legacyMatchId: pairKey,
-        legacyMatchValid: isValidActiveMatch(freshLegacyMatch),
       });
 
       if (decision.action === 'reuse' && decision.source === 'pair') {
-        tx.update(activeMatchRef!, {
-          directRoomVersion: 1,
-          hiddenFor: [],
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        tx.set(pairRef, {
-          pairKey,
-          userIds: ids,
-          activeMatchId: decision.matchId,
-          closedMatchId: admin.firestore.FieldValue.delete(),
-          closedReason: admin.firestore.FieldValue.delete(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-        return {
-          matchId: decision.matchId,
-          pointBalance: decision.pointBalance,
-          alreadyExists: decision.alreadyExists,
-          createdNew: false,
-        };
-      }
-
-      if (decision.action === 'reuse' && decision.source === 'legacy') {
-        tx.update(legacyMatchRef, {
-          directRoomVersion: 1,
-          hiddenFor: [],
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        tx.set(pairRef, {
-          pairKey,
-          userIds: ids,
-          activeMatchId: pairKey,
-          closedMatchId: admin.firestore.FieldValue.delete(),
-          closedReason: admin.firestore.FieldValue.delete(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
         return {
           matchId: decision.matchId,
           pointBalance: decision.pointBalance,
@@ -9126,8 +9463,8 @@ export const startChat = regionalFunctions.https.onCall(
 
     if (chatResult.createdNew) {
       await notifyNewDirectChat({
-        starterName: myData.displayName ?? 'Hana',
         matchId: chatResult.matchId,
+        senderUid: uid,
         recipientUid: targetUid,
       });
     }

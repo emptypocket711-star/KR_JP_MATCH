@@ -2,8 +2,6 @@ export interface StartChatPolicyInput {
   currentPoints: number;
   activePairMatchId?: string;
   activePairMatchValid: boolean;
-  legacyMatchId: string;
-  legacyMatchValid: boolean;
 }
 
 export type StartChatPolicyDecision =
@@ -12,7 +10,7 @@ export type StartChatPolicyDecision =
       matchId: string;
       pointBalance: number;
       alreadyExists: true;
-      source: 'pair' | 'legacy';
+      source: 'pair';
     }
   | {
       action: 'create';
@@ -40,16 +38,6 @@ export function decideStartChatPolicy(
     };
   }
 
-  if (input.legacyMatchValid) {
-    return {
-      action: 'reuse',
-      matchId: input.legacyMatchId,
-      pointBalance: input.currentPoints,
-      alreadyExists: true,
-      source: 'legacy',
-    };
-  }
-
   if (input.currentPoints <= 0) {
     return { action: 'insufficient-points' };
   }
@@ -58,6 +46,97 @@ export function decideStartChatPolicy(
     action: 'create',
     pointBalance: input.currentPoints - 1,
     alreadyExists: false,
+  };
+}
+
+export interface ReusableDirectRoomInput {
+  matchId: string;
+  matchExists: boolean;
+  matchActive: boolean;
+  matchUserIds?: unknown;
+  matchPairKey?: unknown;
+  directRoomVersion?: unknown;
+  hiddenFor?: unknown;
+  expectedUserIds: readonly string[];
+  pointerExists: boolean;
+  pointerId: string;
+  pointerUserIds?: unknown;
+  pointerPairKey?: unknown;
+  pointerActiveMatchId?: unknown;
+  pointerClosedMatchId?: unknown;
+  pointerClosedReason?: unknown;
+}
+
+/**
+ * A room is reusable only after the explicit V1 migration has completed and
+ * the one current pair pointer still names that exact, fully visible room.
+ * Historical rooms with any hidden participant are never reactivated.
+ */
+export function isReusableDirectRoom(
+  input: ReusableDirectRoomInput
+): boolean {
+  if (
+    input.expectedUserIds.length !== 2 ||
+    !input.matchExists ||
+    !input.matchActive ||
+    input.directRoomVersion !== 1 ||
+    input.matchPairKey !== input.pointerId ||
+    !Array.isArray(input.hiddenFor) ||
+    input.hiddenFor.length !== 0 ||
+    !isExactDirectChatParticipants(
+      input.matchUserIds,
+      input.expectedUserIds
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    input.pointerExists &&
+    input.pointerId === input.matchPairKey &&
+    input.pointerPairKey === input.matchPairKey &&
+    input.pointerActiveMatchId === input.matchId &&
+    input.pointerClosedMatchId === undefined &&
+    input.pointerClosedReason === undefined &&
+    isExactDirectChatParticipants(
+      input.pointerUserIds,
+      input.expectedUserIds
+    )
+  );
+}
+
+export const MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION = 100;
+
+/**
+ * Validates a bounded canonical-pair query and returns every exact active room.
+ * The caller must abort when the sentinel makes `scanComplete` false.
+ */
+export function activePairRoomIdsForSafety(input: {
+  records: readonly {
+    id: string;
+    isActive: unknown;
+    userIds: unknown;
+  }[];
+  actorUid: string;
+  targetUid: string;
+}): { scanComplete: boolean; matchIds: string[] } {
+  const scanComplete =
+    input.records.length <= MAX_ACTIVE_PAIR_ROOMS_PER_SAFETY_ACTION;
+  if (!scanComplete) return { scanComplete: false, matchIds: [] };
+
+  return {
+    scanComplete: true,
+    matchIds: input.records
+      .filter((record) =>
+        record.isActive === true &&
+        isExactDirectChatParticipants(record.userIds, [
+          input.actorUid,
+          input.targetUid,
+        ])
+      )
+      .map((record) => record.id)
+      .filter((id) => id.length > 0)
+      .sort(),
   };
 }
 

@@ -269,6 +269,18 @@ export function classifyDirectRoomRemediation(input: {
   for (const entry of normalizedMatches) {
     const { match, normalized } = entry;
     const states = normalized.userIds.map((uid) => accounts.get(uid) ?? 'missing');
+    const ineligibleIndexes = states.flatMap((state, index) =>
+      state === 'ineligible' ? [index] : []
+    );
+    if (ineligibleIndexes.length > 0) {
+      addFinding(findings, findingKeys, {
+        code: 'close-room-participant-state-conflict',
+        matchId: match.id,
+        pairKey: normalized.pairKey,
+        participantKey: normalized.participantKey,
+      });
+      continue;
+    }
     const unavailableIndexes = states.flatMap((state, index) =>
       state === 'missing' || state === 'deleted' ? [index] : []
     );
