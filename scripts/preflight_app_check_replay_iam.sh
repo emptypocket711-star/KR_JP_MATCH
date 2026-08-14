@@ -20,7 +20,7 @@ REQUIRED_ROLE="roles/firebaseappcheck.tokenVerifier"
 if ! gcloud projects get-iam-policy "$PROJECT_ID" \
   --flatten='bindings[].members' \
   --filter="bindings.role=${REQUIRED_ROLE} AND bindings.members=serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
-  --format='value(bindings.role)' | rg -Fxq "$REQUIRED_ROLE"
+  --format='value(bindings.role)' | grep -Fxq "$REQUIRED_ROLE"
 then
   cat <<ERROR >&2
 App Check replay-protection IAM binding is missing.
