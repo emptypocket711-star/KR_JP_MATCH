@@ -2,51 +2,120 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    function hasUsableAccount(uid) {
+      let accountPath = /databases/$(database)/documents/users/$(uid);
+      let account = get(accountPath).data;
+      return exists(accountPath)
+        && (!account.keys().hasAny(["isBanned"]) || account.isBanned != true)
+        && (!account.keys().hasAny(["status"])
+          || !(account.status in ["banned", "deleted", "deactivated"]))
+        && (!account.keys().hasAny(["accountStatus"])
+          || !(account.accountStatus in [
+            "banned", "deleting", "deleted", "deactivated"
+          ]))
+        && (!account.keys().hasAny(["isDeleted"]) || account.isDeleted != true)
+        && (!account.keys().hasAny(["deleted"]) || account.deleted != true)
+        && (!account.keys().hasAny(["deletionRequested"])
+          || account.deletionRequested != true)
+        && !account.keys().hasAny(["deletedAt"]);
+    }
+
+    function hasExactDirectRoomParticipants(room) {
+      return room.userIds is list
+        && room.userIds.size() == 2
+        && room.userIds[0] is string
+        && room.userIds[1] is string
+        && room.userIds[0] != room.userIds[1];
+    }
+
+    function hasCurrentDirectRoomPointer(matchId, room) {
+      let pointerPath =
+        /databases/$(database)/documents/chatPairs/$(room.pairKey);
+      let pointer = get(pointerPath).data;
+      return room.pairKey is string
+        && exists(pointerPath)
+        && pointer.pairKey == room.pairKey
+        && pointer.activeMatchId == matchId
+        && pointer.userIds is list
+        && pointer.userIds.size() == 2
+        && room.userIds[0] in pointer.userIds
+        && room.userIds[1] in pointer.userIds
+        && !pointer.keys().hasAny(["closedMatchId", "closedReason"]);
+    }
+
+    function directRoomParticipantsAreUsableAndUnblocked(room) {
+      let firstUid = room.userIds[0];
+      let secondUid = room.userIds[1];
+      return hasUsableAccount(firstUid)
+        && hasUsableAccount(secondUid)
+        && !exists(/databases/$(database)/documents/users/$(firstUid)/blocks/$(secondUid))
+        && !exists(/databases/$(database)/documents/users/$(secondUid)/blocks/$(firstUid));
+    }
+
+    function canReadDirectRoom(matchId, room) {
+      return request.auth != null
+        && hasExactDirectRoomParticipants(room)
+        && request.auth.uid in room.userIds
+        && room.isActive == true
+        && room.directRoomVersion == 1
+        && room.hiddenFor is list
+        && room.hiddenFor.size() == 0
+        && hasCurrentDirectRoomPointer(matchId, room)
+        && directRoomParticipantsAreUsableAndUnblocked(room);
+    }
+
+    function isValidOwnUserSettingsUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let next = request.resource.data;
+      return changed.hasOnly([
+          "notificationsEnabled",
+          "nightQuietEnabled",
+          "uiLanguage",
+          "lastSeenAt",
+          "updatedAt"
+        ])
+        && (!changed.hasAny(["notificationsEnabled"])
+          || next.notificationsEnabled is bool)
+        && (!changed.hasAny(["nightQuietEnabled"])
+          || next.nightQuietEnabled is bool)
+        && (!changed.hasAny(["uiLanguage"])
+          || !next.keys().hasAny(["uiLanguage"])
+          || next.uiLanguage in ["ko", "ja"])
+        && (!changed.hasAny(["lastSeenAt"])
+          || next.lastSeenAt is timestamp)
+        && (!changed.hasAny(["updatedAt"])
+          || next.updatedAt is timestamp);
+    }
+
     match /{document=**} {
       allow read, write: if false;
     }
 
     // ===== users/{uid} =====
     match /users/{uid} {
-      allow read: if request.auth != null;
+      allow read: if request.auth != null && request.auth.uid == uid;
 
-      allow create: if request.auth != null && request.auth.uid == uid
-        && !request.resource.data.keys().hasAny([
-          "quotaRemaining",
-          "quotaResetAt",
-          "extraQuotaPurchased",
-          "isBanned",
-          "reportCount",
-          "uniqueReporterCount",
-          "lastReportedAt",
-          "bannedAt",
-          "banReason"
-        ]);
+      // User profile creation is server-owned through completeOnboarding so
+      // initial points, moderation state, and safety counters cannot be forged.
+      allow create: if false;
 
+      // Profile and identity fields are server-owned through updateMyProfile.
+      // Direct writes remain limited to low-risk settings and presence state.
       allow update: if request.auth != null && request.auth.uid == uid
-        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          "quotaRemaining",
-          "quotaResetAt",
-          "extraQuotaPurchased",
-          "isBanned",
-          "reportCount",
-          "uniqueReporterCount",
-          "lastReportedAt",
-          "bannedAt",
-          "banReason",
-          "likeCount",
-          "ratingSum",
-          "ratingCount",
-          "avgRating",
-          "keyCount",
-          "dailyKeyLimit"
-        ]);
-
-      // 다른 유저가 하트를 보낼 때 likeCount만 +1 허용
-      allow update: if request.auth != null
-        && request.auth.uid != uid
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likeCount'])
-        && request.resource.data.likeCount == resource.data.get('likeCount', 0) + 1;
+        && (!resource.data.keys().hasAny(["isBanned"])
+          || resource.data.isBanned != true)
+        && (!resource.data.keys().hasAny(["status"])
+          || (resource.data.status != "banned"
+            && resource.data.status != "deleted"
+            && resource.data.status != "deactivated"))
+        && (!resource.data.keys().hasAny(["deletionRequested"])
+          || resource.data.deletionRequested != true)
+        && (!resource.data.keys().hasAny(["accountStatus"])
+          || (resource.data.accountStatus != "deleting"
+            && resource.data.accountStatus != "deleted"
+            && resource.data.accountStatus != "deactivated"
+            && resource.data.accountStatus != "banned"))
+        && isValidOwnUserSettingsUpdate();
 
       match /seen/{otherUid} {
         allow read, write: if false;
@@ -67,53 +136,84 @@ service cloud.firestore {
     }
 
     // ===== likes/{fromUid_toUid} =====
-    // 클라이언트에서 직접 좋아요 처리 (Cloud Functions 미배포 환경)
+    // Discovery likes are server-owned so block/report checks cannot be bypassed.
     match /likes/{likeId} {
       allow read: if request.auth != null
         && (request.auth.uid == resource.data.fromUid
             || request.auth.uid == resource.data.toUid);
-      allow create: if request.auth != null
-        && request.auth.uid == request.resource.data.fromUid;
-      allow delete: if request.auth != null
-        && request.auth.uid == resource.data.fromUid;
+      allow create, update, delete: if false;
     }
 
     // ===== matches/{matchId} =====
     match /matches/{matchId} {
-      // resource == null: 문서가 없는 경우 존재 여부 확인 허용
-      allow read: if request.auth != null
-        && (resource == null || request.auth.uid in resource.data.userIds);
+      allow get: if canReadDirectRoom(matchId, resource.data);
+      // Per-room peer/block/pointer checks are not query-provable in Firestore
+      // Rules. Active lists are returned by the server-owned listActiveChats
+      // callable after the same checks are re-run transactionally.
+      allow list: if false;
 
-      // 매칭된 두 유저 중 한 명이 생성 가능
-      allow create: if request.auth != null
-        && request.auth.uid in request.resource.data.userIds;
-
-      // 메시지 전송 등 업데이트 허용
-      allow update: if request.auth != null
-        && request.auth.uid in resource.data.userIds;
+      // Chat-room creation, point deduction, leaving, favorites, unread updates,
+      // and summary updates are server-owned Cloud Function operations.
+      allow create, update, delete: if false;
 
       match /messages/{messageId} {
-        allow read: if request.auth != null
-          && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.userIds;
-        allow create: if request.auth != null
-          && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.userIds
-          && request.auth.uid == request.resource.data.senderId;
+        allow read: if canReadDirectRoom(
+          matchId,
+          get(/databases/$(database)/documents/matches/$(matchId)).data
+        );
+
+        // Message writes go through the sendMessage callable so the server can
+        // enforce active-room, block, ban, and immutable originalText checks.
+        allow create, update, delete: if false;
       }
+    }
+
+    // ===== chatPairs/{pairKey} =====
+    // Pair pointers are server-owned implementation details for startChat.
+    match /chatPairs/{pairKey} {
+      allow read, write: if false;
+    }
+
+    // ===== calls/{callId} =====
+    // Call creation, point charging, accepting, ending, and extension are
+    // server-owned. Participants can only read their own call state.
+    match /calls/{callId} {
+      allow read: if request.auth != null
+        && resource.data.callerUid is string
+        && resource.data.calleeUid is string
+        && resource.data.callerUid != resource.data.calleeUid
+        && (request.auth.uid == resource.data.callerUid
+            || request.auth.uid == resource.data.calleeUid)
+        && hasUsableAccount(resource.data.callerUid)
+        && hasUsableAccount(resource.data.calleeUid)
+        && !exists(/databases/$(database)/documents/users/$(resource.data.callerUid)/blocks/$(resource.data.calleeUid))
+        && !exists(/databases/$(database)/documents/users/$(resource.data.calleeUid)/blocks/$(resource.data.callerUid));
+      allow create, update, delete: if false;
+    }
+
+    // Active call pointers are server-owned implementation details.
+    match /activeCalls/{matchId} {
+      allow read, write: if false;
+    }
+
+    // Daily free voice-call quotas are server-owned.
+    match /callDailyQuotas/{quotaId} {
+      allow read, write: if false;
     }
 
     // ===== posts/{postId} =====
     match /posts/{postId} {
-      allow read: if request.auth != null;
-      allow create: if request.auth != null;
-      allow update, delete: if request.auth != null
-        && request.auth.uid == resource.data.uid;
+      // Lounge reads go through Cloud Functions so block/report visibility can
+      // include users who blocked the caller.
+      allow read: if false;
+      allow create, update, delete: if false;
 
       match /comments/{commentId} {
-        allow read: if request.auth != null;
+        allow read: if false;
         allow create, update, delete: if false;
 
         match /replies/{replyId} {
-          allow read: if request.auth != null;
+          allow read: if false;
           allow create, update, delete: if false;
         }
       }
@@ -121,8 +221,7 @@ service cloud.firestore {
 
     // ===== post_likes/{postId}/likes/{uid} =====
     match /post_likes/{postId}/likes/{uid} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null && request.auth.uid == uid;
+      allow read, write: if false;
     }
 
     // ===== ratings/{ratingId} =====
@@ -130,12 +229,7 @@ service cloud.firestore {
       allow read: if request.auth != null
         && (request.auth.uid == resource.data.raterUid
             || request.auth.uid == resource.data.ratedUid);
-      allow create: if request.auth != null
-        && request.auth.uid == request.resource.data.raterUid
-        && request.resource.data.stars is int
-        && request.resource.data.stars >= 1
-        && request.resource.data.stars <= 5;
-      allow update, delete: if false;
+      allow create, update, delete: if false;
     }
 
     // ===== reports/{reportId} =====
@@ -145,6 +239,84 @@ service cloud.firestore {
 
     // ===== reportCounters/{targetUid}/reporters/{reporterUid} =====
     match /reportCounters/{targetUid}/{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===== pointEvents/{eventId} =====
+    // Point grants, purchases, consumes, refunds, and future payment ledgers are
+    // server-owned audit records.
+    match /pointEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    // ===== playPurchases/{purchaseTokenHash} =====
+    // Verified Play purchase tokens and grant state are server-owned.
+    match /playPurchases/{purchaseTokenHash} {
+      allow read, write: if false;
+    }
+
+    // ===== storeVerificationQuotas/{uid} =====
+    // Per-account verification budgets are server-owned abuse controls.
+    match /storeVerificationQuotas/{uid} {
+      allow read, write: if false;
+    }
+
+    // ===== storeTransactions/{platformTransactionId} =====
+    // Globally unique verified store transactions and their grant state are
+    // server-owned. Clients receive only the callable result and public point
+    // balance, never ledger or receipt metadata.
+    match /storeTransactions/{platformTransactionId} {
+      allow read, write: if false;
+    }
+
+    // ===== pendingStorePurchases/{pendingId} =====
+    // Retry leases, purchase tokens, attempt counts, and terminal state are
+    // server-owned and must not be disclosed or reset by clients.
+    match /pendingStorePurchases/{pendingId} {
+      allow read, write: if false;
+    }
+
+    // ===== fcmTokenOwners/{tokenHash} =====
+    // A token can belong to only one current Firebase account. Raw tokens and
+    // ownership transfers are server-owned.
+    match /fcmTokenOwners/{tokenHash} {
+      allow read, write: if false;
+    }
+
+    // ===== accountDeletionJobs/{uid} =====
+    // Cleanup stage/error state is operational server data. The callable
+    // exposes only its final result so clients cannot forge completion.
+    match /accountDeletionJobs/{uid} {
+      allow read, write: if false;
+    }
+
+    // Media upload reservations and daily counters are server-owned abuse and
+    // billing controls. Storage Rules may read them internally; clients may not.
+    match /mediaUploadAuthorizations/{authorizationId} {
+      allow read, write: if false;
+    }
+
+    match /mediaUploadQuotas/{quotaId} {
+      allow read, write: if false;
+    }
+
+    match /privateMediaReadQuotas/{quotaId} {
+      allow read, write: if false;
+    }
+
+    match /mediaUploadRequestQuotas/{quotaId} {
+      allow read, write: if false;
+    }
+
+    match /mediaUploadGenerationCleanups/{cleanupId} {
+      allow read, write: if false;
+    }
+
+    match /mediaUploadCleanupWorkerState/{workerId} {
+      allow read, write: if false;
+    }
+
+    match /privateMediaRolloutControls/{controlId} {
       allow read, write: if false;
     }
   }

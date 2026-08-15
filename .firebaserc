@@ -1,7 +1,8 @@
 {
   "projects": {
-    "ㅛ": "hana-e2ee6",
-    " default": "hana-e2ee6"
+    "default": "hana-e2ee6",
+    "staging": "hana-e2ee6",
+    "production": "hana-production-tokyo"
   },
   "targets": {},
   "etags": {}

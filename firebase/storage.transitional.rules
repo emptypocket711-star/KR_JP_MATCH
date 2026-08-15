@@ -1,0 +1,99 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isUsableAccount(uid) {
+      let userPath = /databases/(default)/documents/users/$(uid);
+      return request.auth != null
+        && firestore.exists(userPath)
+        && (!('isBanned' in firestore.get(userPath).data)
+          || firestore.get(userPath).data.isBanned != true)
+        && (!('isDeleted' in firestore.get(userPath).data)
+          || firestore.get(userPath).data.isDeleted != true)
+        && (!('deleted' in firestore.get(userPath).data)
+          || firestore.get(userPath).data.deleted != true)
+        && (!('deletedAt' in firestore.get(userPath).data)
+          || firestore.get(userPath).data.deletedAt == null)
+        && (!('deletionRequested' in firestore.get(userPath).data)
+          || firestore.get(userPath).data.deletionRequested != true)
+        && (!('status' in firestore.get(userPath).data)
+          || (firestore.get(userPath).data.status != 'banned'
+            && firestore.get(userPath).data.status != 'deleted'
+            && firestore.get(userPath).data.status != 'deactivated'))
+        && (!('accountStatus' in firestore.get(userPath).data)
+          || (firestore.get(userPath).data.accountStatus != 'deleting'
+            && firestore.get(userPath).data.accountStatus != 'deleted'
+            && firestore.get(userPath).data.accountStatus != 'deactivated'
+            && firestore.get(userPath).data.accountStatus != 'banned'));
+    }
+
+    function isValidV1ReservedUpload(
+      authorizationId,
+      kind,
+      objectPath,
+      matchId
+    ) {
+      let authorizationPath = /databases/(default)/documents/mediaUploadAuthorizations/$(authorizationId);
+      let authorization = firestore.get(authorizationPath).data;
+      return request.auth != null
+        && isUsableAccount(request.auth.uid)
+        && firestore.exists(authorizationPath)
+        // Protocol V1 is intentionally the absence of the version field. A V2
+        // reservation is never a direct Storage capability during rollout.
+        && !('uploadProtocolVersion' in authorization)
+        && authorization.uid == request.auth.uid
+        && authorization.kind == kind
+        && authorization.objectPath == objectPath
+        && (kind == 'profile' || authorization.matchId == matchId)
+        && authorization.status == 'reserved'
+        && authorization.contentType == 'image/jpeg'
+        && authorization.maxBytes == 5 * 1024 * 1024
+        && authorization.expiresAt is timestamp
+        && authorization.expiresAt > request.time;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // This reviewed artifact bridges only the reservation-bound canonical V1
+    // client. Any environment that still supports older legacy prefixes needs
+    // a separately audited live-rules migration; do not infer that support here.
+    match /profile_media/{uid}/{authorizationId}/image.jpg {
+      allow get, list: if false;
+      allow create: if request.auth != null
+        && request.auth.uid == uid
+        && isValidV1ReservedUpload(
+          authorizationId,
+          'profile',
+          'profile_media/' + uid + '/' + authorizationId + '/image.jpg',
+          null
+        )
+        && request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType == 'image/jpeg'
+        && request.resource.metadata.keys().hasOnly(['hanaCacheControl'])
+        && request.resource.metadata.get('hanaCacheControl', '')
+          == 'private, no-store, max-age=0';
+      allow update, delete: if false;
+    }
+
+    match /chat_images/{matchId}/{uid}/{authorizationId}/image.jpg {
+      allow get, list: if false;
+      allow create: if request.auth != null
+        && request.auth.uid == uid
+        && isValidV1ReservedUpload(
+          authorizationId,
+          'chat',
+          'chat_images/' + matchId + '/' + uid + '/' + authorizationId + '/image.jpg',
+          matchId
+        )
+        && request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType == 'image/jpeg'
+        && request.resource.metadata.keys().hasOnly(['hanaCacheControl'])
+        && request.resource.metadata.get('hanaCacheControl', '')
+          == 'private, no-store, max-age=0';
+      allow update, delete: if false;
+    }
+  }
+}

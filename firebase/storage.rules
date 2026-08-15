@@ -5,24 +5,48 @@ service firebase.storage {
       allow read, write: if false;
     }
 
-    // Profile photos (legacy path)
+    // Legacy upload paths are read/delete-only during the compatibility
+    // rollout. New writes require a short-lived server reservation.
     match /profile_photos/{uid}/{filename=**} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null
-        && request.auth.uid == uid
-        && request.resource.size <= 5 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*');
+      // Public profile media is served from server-validated URLs. Listing a
+      // user's historical objects would expose removed photos, so SDK reads
+      // and list operations stay closed.
+      allow read: if false;
+      allow write: if false;
       allow delete: if request.auth != null && request.auth.uid == uid;
     }
 
     // User photos (onboarding + profile edit): users/{uid}/photo_*.jpg
-    match /users/{uid}/{filename=**} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null
-        && request.auth.uid == uid
-        && request.resource.size <= 10 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*');
+    match /users/{uid}/{filename} {
+      allow read: if false;
+      allow write: if false;
       allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    match /profile_media/{uid}/{authorizationId}/image.jpg {
+      // Canonical media reads use the Auth + App Check callable byte proxy.
+      // A direct Storage evaluation may inspect only two Firestore documents,
+      // which cannot prove both account availability and bilateral blocks.
+      allow get: if false;
+      allow list: if false;
+      // Canonical writes are owned by uploadPrivateMediaBytes. A reservation
+      // document is not a client Storage capability in protocol V2.
+      allow create: if false;
+      allow update: if false;
+      // New reserved objects are deleted only by trusted server cleanup. If a
+      // client could delete and recreate the same path, one reservation could
+      // be replayed for unlimited upload bandwidth during its 5-minute lease.
+      allow delete: if false;
+    }
+
+    // Chat images uploaded before the server-owned sendMessage callable
+    // creates an image message document.
+    match /chat_images/{matchId}/{uid}/{authorizationId}/image.jpg {
+      allow get: if false;
+      allow list: if false;
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
     }
   }
 }
